@@ -22,12 +22,13 @@ impl ProcMem {
     }
 
     pub(crate) fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize, String> {
+        let len = buf.len();
         loop {
             let ret = unsafe {
                 libc::pread(
                     self.file.as_raw_fd(),
                     buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
+                    len,
                     offset as libc::off_t,
                 )
             };
@@ -38,17 +39,24 @@ impl ProcMem {
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            return Err(format!("pread 失败 offset=0x{:x}: {}", offset, err));
+            return Err(format!(
+                "pread 失败 offset=0x{:x} len={}: {} (errno={})",
+                offset,
+                len,
+                err,
+                err.raw_os_error().unwrap_or(0)
+            ));
         }
     }
 
     pub(crate) fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize, String> {
+        let len = buf.len();
         loop {
             let ret = unsafe {
                 libc::pwrite(
                     self.file.as_raw_fd(),
                     buf.as_ptr() as *const libc::c_void,
-                    buf.len(),
+                    len,
                     offset as libc::off_t,
                 )
             };
@@ -59,21 +67,34 @@ impl ProcMem {
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            return Err(format!("pwrite 失败 offset=0x{:x}: {}", offset, err));
+            return Err(format!(
+                "pwrite 失败 offset=0x{:x} len={}: {} (errno={})",
+                offset,
+                len,
+                err,
+                err.raw_os_error().unwrap_or(0)
+            ));
         }
     }
 
     /// 读取所有请求的字节，失败返回错误
     pub(crate) fn pread_exact(&self, buf: &mut [u8], offset: u64) -> Result<(), String> {
+        let total_len = buf.len();
         let mut total = 0;
-        while total < buf.len() {
-            let n = self.pread(&mut buf[total..], offset + total as u64)?;
+        while total < total_len {
+            let n = self.pread(&mut buf[total..], offset + total as u64).map_err(|e| {
+                format!(
+                    "{} (pread_exact start=0x{:x} total_len={} done={})",
+                    e, offset, total_len, total
+                )
+            })?;
             if n == 0 {
                 return Err(format!(
-                    "pread EOF at offset=0x{:x}, read {}/{}",
+                    "pread EOF at offset=0x{:x} (start=0x{:x} total_len={} done={})",
                     offset + total as u64,
-                    total,
-                    buf.len()
+                    offset,
+                    total_len,
+                    total
                 ));
             }
             total += n;
@@ -83,15 +104,22 @@ impl ProcMem {
 
     /// 写入所有请求的字节，失败返回错误
     pub(crate) fn pwrite_all(&self, buf: &[u8], offset: u64) -> Result<(), String> {
+        let total_len = buf.len();
         let mut total = 0;
-        while total < buf.len() {
-            let n = self.pwrite(&buf[total..], offset + total as u64)?;
+        while total < total_len {
+            let n = self.pwrite(&buf[total..], offset + total as u64).map_err(|e| {
+                format!(
+                    "{} (pwrite_all start=0x{:x} total_len={} done={})",
+                    e, offset, total_len, total
+                )
+            })?;
             if n == 0 {
                 return Err(format!(
-                    "pwrite 停止 at offset=0x{:x}, wrote {}/{}",
+                    "pwrite 停止 at offset=0x{:x} (start=0x{:x} total_len={} done={})",
                     offset + total as u64,
-                    total,
-                    buf.len()
+                    offset,
+                    total_len,
+                    total
                 ));
             }
             total += n;

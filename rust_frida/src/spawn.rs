@@ -1075,18 +1075,75 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     // 9. 通过 /proc/<pid>/mem 写入 payload
     let mem = ProcMem::open(pid)?;
 
+    // 写入前边界检查：对齐、VMA 覆盖、邻接 VMA 不重叠
+    let write_end = loc
+        .base
+        .checked_add(payload_data.len() as u64)
+        .ok_or_else(|| format!(
+            "payload 写入范围溢出 u64: base=0x{:x} len={}",
+            loc.base,
+            payload_data.len()
+        ))?;
+    if (loc.base & (page_size as u64 - 1)) != 0 {
+        return Err(format!(
+            "payload base 非页对齐: 0x{:x} page_size=0x{:x}{}",
+            loc.base,
+            page_size,
+            dump_maps_near(&maps, loc.base, 2)
+        ));
+    }
+    if write_end > loc.vma_end {
+        return Err(format!(
+            "payload 写入越过 VMA 末端: base=0x{:x} len={} write_end=0x{:x} vma=[0x{:x},0x{:x}) perms={} path={}{}",
+            loc.base,
+            payload_data.len(),
+            write_end,
+            loc.vma_start,
+            loc.vma_end,
+            loc.perms,
+            loc.path,
+            dump_maps_near(&maps, loc.base, 2)
+        ));
+    }
+    log_verbose!(
+        "payload 写入范围: [0x{:x},0x{:x}) len={} vma=[0x{:x},0x{:x}) perms={} page_size=0x{:x}",
+        loc.base,
+        write_end,
+        payload_data.len(),
+        loc.vma_start,
+        loc.vma_end,
+        loc.perms,
+        page_size
+    );
+
     // 备份原始数据
     // 与 Frida 一致：already-patched 时从 backing 文件读取真正的原始数据（COW 场景）
     let payload_backup = if already_patched {
         read_backing_file_data(&loc.path, loc.file_offset, payload_data.len())?
     } else {
         let mut buf = vec![0u8; payload_data.len()];
-        mem.pread_exact(&mut buf, loc.base)?;
+        mem.pread_exact(&mut buf, loc.base).map_err(|e| {
+            format!(
+                "payload 预读失败 (用于备份): {}{}",
+                e,
+                dump_maps_near(&maps, loc.base, 2)
+            )
+        })?;
         buf
     };
 
     // 写入 payload
-    mem.pwrite_all(&payload_data, loc.base)?;
+    mem.pwrite_all(&payload_data, loc.base).map_err(|e| {
+        format!(
+            "payload 写入失败: {} vma=[0x{:x},0x{:x}) perms={} path={}{}",
+            e,
+            loc.vma_start,
+            loc.vma_end,
+            loc.perms,
+            loc.path,
+            dump_maps_near(&maps, loc.base, 2)
+        )
+    })?;
     log_verbose!("Payload 写入完成");
 
     // 10. 替换 setArgV0 指针 → zymbiote replacement（Some 时）
@@ -1201,7 +1258,10 @@ fn read_backing_file_data(path: &str, file_offset: u64, len: usize) -> Result<Ve
 /// Payload 写入位置信息
 struct PayloadLocation {
     base: u64,
+    vma_start: u64,
+    vma_end: u64,
     prot: u64,
+    perms: String,
     path: String,     // 映射的backing文件路径（用于 COW 还原）
     file_offset: u64, // backing文件中的偏移
 }
@@ -1210,10 +1270,28 @@ struct PayloadLocation {
 /// 与 Frida 一致：取第一个匹配的 libstagefright.so R+X 段
 fn find_payload_location(maps: &[MapEntry]) -> Result<PayloadLocation, String> {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    if page_size == 0 || (page_size & (page_size - 1)) != 0 {
+        return Err(format!("非法 page_size: {}", page_size));
+    }
 
     // 查找 libstagefright.so 的第一个 r-x 段（与 Frida payload_base == 0 guard 一致）
     for entry in maps {
         if entry.path.ends_with("/libstagefright.so") && entry.is_readable() && entry.is_executable() {
+            if entry.end <= entry.start || entry.end - entry.start < page_size {
+                return Err(format!(
+                    "libstagefright.so R+X 段过小: start=0x{:x} end=0x{:x} size=0x{:x} page_size=0x{:x}",
+                    entry.start,
+                    entry.end,
+                    entry.end - entry.start,
+                    page_size
+                ));
+            }
+            if (entry.start & (page_size - 1)) != 0 || (entry.end & (page_size - 1)) != 0 {
+                return Err(format!(
+                    "libstagefright.so VMA 非页对齐: start=0x{:x} end=0x{:x} page_size=0x{:x}",
+                    entry.start, entry.end, page_size
+                ));
+            }
             let base = entry.end - page_size;
             // 与 Frida 一致：基础 prot = R|X，如果段可写则加 W
             let mut prot = (libc::PROT_READ | libc::PROT_EXEC) as u64;
@@ -1224,7 +1302,10 @@ fn find_payload_location(maps: &[MapEntry]) -> Result<PayloadLocation, String> {
             let file_offset = entry.offset + (base - entry.start);
             return Ok(PayloadLocation {
                 base,
+                vma_start: entry.start,
+                vma_end: entry.end,
                 prot,
+                perms: entry.perms.clone(),
                 path: entry.path.clone(),
                 file_offset,
             });
@@ -1232,6 +1313,33 @@ fn find_payload_location(maps: &[MapEntry]) -> Result<PayloadLocation, String> {
     }
 
     Err("未找到 libstagefright.so 的 R+X 段，无法写入 payload".to_string())
+}
+
+/// 格式化给定虚拟地址范围附近的 VMA 列表（用于写入失败时诊断）
+fn dump_maps_near(maps: &[MapEntry], addr: u64, radius: usize) -> String {
+    let mut idx_hit = None;
+    for (i, e) in maps.iter().enumerate() {
+        if addr >= e.start && addr < e.end {
+            idx_hit = Some(i);
+            break;
+        }
+        if addr < e.start {
+            idx_hit = Some(i);
+            break;
+        }
+    }
+    let center = idx_hit.unwrap_or(maps.len().saturating_sub(1));
+    let lo = center.saturating_sub(radius);
+    let hi = (center + radius + 1).min(maps.len());
+    let mut out = String::new();
+    for e in &maps[lo..hi] {
+        let marker = if addr >= e.start && addr < e.end { " <== HIT" } else { "" };
+        out.push_str(&format!(
+            "\n    0x{:x}-0x{:x} {} off=0x{:x} {}{}",
+            e.start, e.end, e.perms, e.offset, e.path, marker
+        ));
+    }
+    out
 }
 
 /// libc 函数地址集合
