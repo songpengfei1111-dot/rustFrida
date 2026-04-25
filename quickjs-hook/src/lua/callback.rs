@@ -46,6 +46,25 @@ static QUICK_DROP_BEGIN: AtomicU64 = AtomicU64::new(0);
 static QUICK_DROP_END: AtomicU64 = AtomicU64::new(0);
 static QUICK_FULL_SUSPEND_BEGIN: AtomicU64 = AtomicU64::new(0);
 static QUICK_FULL_SUSPEND_END: AtomicU64 = AtomicU64::new(0);
+static QUICK_SUSPEND_SERVICE_BEGIN: AtomicU64 = AtomicU64::new(0);
+static QUICK_SUSPEND_SERVICE_END: AtomicU64 = AtomicU64::new(0);
+static QUICK_CALLBACK_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static QUICK_CALLBACK_MAX_NS: AtomicU64 = AtomicU64::new(0);
+static QUICK_MAIN_CALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QUICK_MAIN_CALLBACK_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static QUICK_MAIN_CALLBACK_MAX_NS: AtomicU64 = AtomicU64::new(0);
+static QUICK_TRANS_START_BEFORE_RUNNABLE: AtomicU64 = AtomicU64::new(0);
+static QUICK_TRANS_START_AFTER_NATIVE: AtomicU64 = AtomicU64::new(0);
+static QUICK_TRANS_START_AFTER_OTHER: AtomicU64 = AtomicU64::new(0);
+static QUICK_TRANS_END_BEFORE_NATIVE: AtomicU64 = AtomicU64::new(0);
+static QUICK_TRANS_END_AFTER_RUNNABLE: AtomicU64 = AtomicU64::new(0);
+static QUICK_TRANS_END_AFTER_OTHER: AtomicU64 = AtomicU64::new(0);
+static QUICK_TRANS_START_FLAGS: AtomicU64 = AtomicU64::new(0);
+static QUICK_TRANS_END_FLAGS: AtomicU64 = AtomicU64::new(0);
+static QUICK_TRANS_LAST_START_BEFORE: AtomicU64 = AtomicU64::new(0);
+static QUICK_TRANS_LAST_START_AFTER: AtomicU64 = AtomicU64::new(0);
+static QUICK_TRANS_LAST_END_BEFORE: AtomicU64 = AtomicU64::new(0);
+static QUICK_TRANS_LAST_END_AFTER: AtomicU64 = AtomicU64::new(0);
 static QUICK_ACTIVE_SLOTS: OnceLock<Vec<QuickActiveSlot>> = OnceLock::new();
 
 const QUICK_STAGE_ENTER: u64 = 1;
@@ -96,6 +115,49 @@ fn quick_diag_now_ms() -> u64 {
 #[inline]
 fn quick_diag_tid() -> u64 {
     unsafe { libc::syscall(libc::SYS_gettid as libc::c_long) as u64 }
+}
+
+#[inline]
+fn quick_is_main_thread() -> bool {
+    quick_diag_tid() == unsafe { libc::getpid() as u64 }
+}
+
+#[inline]
+fn atomic_update_max(target: &AtomicU64, value: u64) {
+    let mut observed = target.load(Ordering::Acquire);
+    while value > observed {
+        match target.compare_exchange(observed, value, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(v) => observed = v,
+        }
+    }
+}
+
+struct QuickCallbackTimingGuard {
+    start: std::time::Instant,
+    is_main: bool,
+}
+
+impl QuickCallbackTimingGuard {
+    fn enter() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            is_main: quick_is_main_thread(),
+        }
+    }
+}
+
+impl Drop for QuickCallbackTimingGuard {
+    fn drop(&mut self) {
+        let elapsed_ns = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        QUICK_CALLBACK_TOTAL_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+        atomic_update_max(&QUICK_CALLBACK_MAX_NS, elapsed_ns);
+        if self.is_main {
+            QUICK_MAIN_CALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+            QUICK_MAIN_CALLBACK_TOTAL_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+            atomic_update_max(&QUICK_MAIN_CALLBACK_MAX_NS, elapsed_ns);
+        }
+    }
 }
 
 fn quick_diag_enter(method: u64) -> usize {
@@ -196,11 +258,54 @@ pub(crate) fn quick_diag_snapshot() -> (u64, u64, u64, u64, String) {
         QUICK_DROP_BEGIN.load(Ordering::Acquire),
         QUICK_DROP_END.load(Ordering::Acquire),
         format!(
-            "fullSuspendBegin={} fullSuspendEnd={} slots=[{}]",
+            "suspendServiceBegin={} suspendServiceEnd={} fullSuspendBegin={} fullSuspendEnd={} slots=[{}]",
+            QUICK_SUSPEND_SERVICE_BEGIN.load(Ordering::Acquire),
+            QUICK_SUSPEND_SERVICE_END.load(Ordering::Acquire),
             QUICK_FULL_SUSPEND_BEGIN.load(Ordering::Acquire),
             QUICK_FULL_SUSPEND_END.load(Ordering::Acquire),
             rows.join("; ")
         ),
+    )
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn quick_timing_snapshot() -> (
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+) {
+    (
+        QUICK_CALLBACK_TOTAL_NS.load(Ordering::Acquire),
+        QUICK_CALLBACK_MAX_NS.load(Ordering::Acquire),
+        QUICK_MAIN_CALLBACK_TOTAL.load(Ordering::Acquire),
+        QUICK_MAIN_CALLBACK_TOTAL_NS.load(Ordering::Acquire),
+        QUICK_MAIN_CALLBACK_MAX_NS.load(Ordering::Acquire),
+        QUICK_TRANS_START_BEFORE_RUNNABLE.load(Ordering::Acquire),
+        QUICK_TRANS_START_AFTER_NATIVE.load(Ordering::Acquire),
+        QUICK_TRANS_START_AFTER_OTHER.load(Ordering::Acquire),
+        QUICK_TRANS_END_BEFORE_NATIVE.load(Ordering::Acquire),
+        QUICK_TRANS_END_AFTER_RUNNABLE.load(Ordering::Acquire),
+        QUICK_TRANS_END_AFTER_OTHER.load(Ordering::Acquire),
+        QUICK_TRANS_START_FLAGS.load(Ordering::Acquire),
+        QUICK_TRANS_END_FLAGS.load(Ordering::Acquire),
+        QUICK_TRANS_LAST_START_BEFORE.load(Ordering::Acquire),
+        QUICK_TRANS_LAST_START_AFTER.load(Ordering::Acquire),
+        QUICK_TRANS_LAST_END_BEFORE.load(Ordering::Acquire),
+        QUICK_TRANS_LAST_END_AFTER.load(Ordering::Acquire),
     )
 }
 
@@ -209,6 +314,25 @@ pub(crate) fn reset_quick_diag() {
     QUICK_DROP_END.store(0, Ordering::Release);
     QUICK_FULL_SUSPEND_BEGIN.store(0, Ordering::Release);
     QUICK_FULL_SUSPEND_END.store(0, Ordering::Release);
+    QUICK_SUSPEND_SERVICE_BEGIN.store(0, Ordering::Release);
+    QUICK_SUSPEND_SERVICE_END.store(0, Ordering::Release);
+    QUICK_CALLBACK_TOTAL_NS.store(0, Ordering::Release);
+    QUICK_CALLBACK_MAX_NS.store(0, Ordering::Release);
+    QUICK_MAIN_CALLBACK_TOTAL.store(0, Ordering::Release);
+    QUICK_MAIN_CALLBACK_TOTAL_NS.store(0, Ordering::Release);
+    QUICK_MAIN_CALLBACK_MAX_NS.store(0, Ordering::Release);
+    QUICK_TRANS_START_BEFORE_RUNNABLE.store(0, Ordering::Release);
+    QUICK_TRANS_START_AFTER_NATIVE.store(0, Ordering::Release);
+    QUICK_TRANS_START_AFTER_OTHER.store(0, Ordering::Release);
+    QUICK_TRANS_END_BEFORE_NATIVE.store(0, Ordering::Release);
+    QUICK_TRANS_END_AFTER_RUNNABLE.store(0, Ordering::Release);
+    QUICK_TRANS_END_AFTER_OTHER.store(0, Ordering::Release);
+    QUICK_TRANS_START_FLAGS.store(0, Ordering::Release);
+    QUICK_TRANS_END_FLAGS.store(0, Ordering::Release);
+    QUICK_TRANS_LAST_START_BEFORE.store(0, Ordering::Release);
+    QUICK_TRANS_LAST_START_AFTER.store(0, Ordering::Release);
+    QUICK_TRANS_LAST_END_BEFORE.store(0, Ordering::Release);
+    QUICK_TRANS_LAST_END_AFTER.store(0, Ordering::Release);
     for slot in quick_active_slots() {
         slot.stage.store(0, Ordering::Release);
         slot.method.store(0, Ordering::Release);
@@ -267,17 +391,49 @@ std::thread_local! {
 pub(crate) unsafe fn with_current_quick_runnable<R>(f: impl FnOnce(*mut std::ffi::c_void) -> R) -> Option<R> {
     let current = CURRENT_QUICK_TRANSITION.with(|c| *c.borrow());
     let current = current?;
-    current.bridge.end(current.thread, current.diag_slot);
+    quick_transition_to_runnable(current.bridge, current.thread, current.diag_slot);
+    run_quick_suspend_check_if_requested(current.thread, current.diag_slot);
     let result = f(current.thread);
-    current.bridge.start(current.thread);
+    run_quick_suspend_check_if_requested(current.thread, current.diag_slot);
+    quick_transition_to_native(current.bridge, current.thread);
     Some(result)
+}
+
+pub(crate) unsafe fn service_current_quick_suspend_if_requested() -> bool {
+    let current = CURRENT_QUICK_TRANSITION.with(|c| *c.borrow());
+    let Some(current) = current else {
+        return false;
+    };
+    if !quick_suspend_flags_pending(current.thread) {
+        return false;
+    }
+
+    QUICK_SUSPEND_SERVICE_BEGIN.fetch_add(1, Ordering::Relaxed);
+    quick_transition_to_runnable(current.bridge, current.thread, current.diag_slot);
+    let serviced = if quick_suspend_flags_pending(current.thread) {
+        run_quick_full_suspend_check(current.thread, current.diag_slot)
+    } else {
+        true
+    };
+    quick_transition_to_native(current.bridge, current.thread);
+    QUICK_SUSPEND_SERVICE_END.fetch_add(1, Ordering::Relaxed);
+    serviced
+}
+
+pub(crate) unsafe fn service_quick_suspend_for_thread(thread: *mut std::ffi::c_void) -> bool {
+    if thread.is_null() || !quick_suspend_flags_pending(thread) {
+        return false;
+    }
+    QUICK_SUSPEND_SERVICE_BEGIN.fetch_add(1, Ordering::Relaxed);
+    let serviced = run_quick_full_suspend_check(thread, usize::MAX);
+    QUICK_SUSPEND_SERVICE_END.fetch_add(1, Ordering::Relaxed);
+    serviced
 }
 
 struct ArtNativeTransition {
     thread: *mut std::ffi::c_void,
     bridge: ArtTransitionBridge,
     diag_slot: usize,
-    managed_stack_top: Option<ManagedStackTopGuard>,
     previous_transition: Option<CurrentQuickTransition>,
 }
 
@@ -313,9 +469,7 @@ impl ArtNativeTransition {
             return None;
         };
 
-        let managed_stack_top = ManagedStackTopGuard::publish(thread, ctx_ptr);
-
-        bridge.start(thread);
+        quick_transition_to_native(bridge, thread);
         super::record_native_transition_enter();
         let current = CurrentQuickTransition {
             thread,
@@ -327,7 +481,6 @@ impl ArtNativeTransition {
             thread,
             bridge,
             diag_slot,
-            managed_stack_top,
             previous_transition,
         })
     }
@@ -341,45 +494,18 @@ impl Drop for ArtNativeTransition {
             c.replace(self.previous_transition);
         });
         unsafe {
-            self.bridge.end(self.thread, self.diag_slot);
-        }
-        if let Some(guard) = self.managed_stack_top.take() {
-            guard.restore();
+            quick_transition_to_runnable(self.bridge, self.thread, self.diag_slot);
         }
         QUICK_DROP_END.fetch_add(1, Ordering::Relaxed);
         super::record_native_transition_leave();
     }
 }
 
-struct ManagedStackTopGuard {
-    slot: *mut u64,
-    old_top: u64,
-}
-
-impl ManagedStackTopGuard {
-    unsafe fn publish(thread: *mut std::ffi::c_void, ctx_ptr: *mut hook_ffi::HookContext) -> Option<Self> {
-        if thread.is_null() || ctx_ptr.is_null() {
-            return None;
-        }
-        const ART_ROUTER_FRAME_SIZE: u64 = 224;
-        let router_frame = (*ctx_ptr).sp.checked_sub(ART_ROUTER_FRAME_SIZE)?;
-        let offset = crate::jsapi::java::art_controller::cached_thread_top_quick_frame_offset()?;
-        let slot = (thread as usize + offset) as *mut u64;
-        let old_top = std::ptr::read_volatile(slot);
-        std::ptr::write_volatile(slot, router_frame);
-        Some(Self { slot, old_top })
-    }
-
-    fn restore(self) {
-        unsafe {
-            std::ptr::write_volatile(self.slot, self.old_top);
-        }
-    }
-}
-
 static ART_JNI_TRANSITION: OnceLock<Option<ArtTransitionBridge>> = OnceLock::new();
 static ART_QUICK_JNI_TRANSITION: OnceLock<Option<ArtTransitionBridge>> = OnceLock::new();
 static ART_FULL_SUSPEND_CHECK: OnceLock<Option<ArtFullSuspendCheckFn>> = OnceLock::new();
+static ART_CALLEE_SAVE_SUSPEND_METHOD: OnceLock<u64> = OnceLock::new();
+static ART_QUICK_TEST_SUSPEND_ENTRYPOINT: OnceLock<u64> = OnceLock::new();
 
 const ART_THREAD_STATE_AND_FLAGS_OFFSET: usize = 0;
 const ART_THREAD_FLAG_SUSPEND_REQUEST: u32 = 1 << 0;
@@ -389,6 +515,73 @@ const ART_THREAD_FLAG_ACTIVE_SUSPEND_BARRIER: u32 = 1 << 3;
 const ART_THREAD_STATE_MASK: u32 = 0xff00_0000;
 const ART_THREAD_STATE_RUNNABLE: u32 = 0 << 24;
 const ART_THREAD_STATE_NATIVE: u32 = 92 << 24;
+const QUICK_ENTRYPOINT_COUNT: usize = 174;
+const QUICK_JNI_METHOD_START_INDEX: usize = 45;
+const QUICK_JNI_METHOD_END_INDEX: usize = 46;
+const QUICK_TEST_SUSPEND_INDEX: usize = 105;
+const QUICK_SCAN_LIMIT: usize = 16384;
+const QUICK_MIN_LIBART_POINTERS: usize = 40;
+
+#[inline]
+unsafe fn quick_read_state_and_flags(thread: *mut std::ffi::c_void) -> u32 {
+    if thread.is_null() {
+        return u32::MAX;
+    }
+    let state = (thread as usize + ART_THREAD_STATE_AND_FLAGS_OFFSET) as *const u32;
+    std::ptr::read_volatile(state)
+}
+
+#[inline]
+fn quick_state(value: u32) -> u32 {
+    value & ART_THREAD_STATE_MASK
+}
+
+#[inline]
+fn quick_flags(value: u32) -> u32 {
+    value & quick_suspend_checked_flags()
+}
+
+unsafe fn quick_transition_to_native(bridge: ArtTransitionBridge, thread: *mut std::ffi::c_void) {
+    let before = quick_read_state_and_flags(thread);
+    QUICK_TRANS_LAST_START_BEFORE.store(before as u64, Ordering::Release);
+    if quick_state(before) == ART_THREAD_STATE_RUNNABLE {
+        QUICK_TRANS_START_BEFORE_RUNNABLE.fetch_add(1, Ordering::Relaxed);
+    }
+    if quick_flags(before) != 0 {
+        QUICK_TRANS_START_FLAGS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    bridge.start(thread);
+
+    let after = quick_read_state_and_flags(thread);
+    QUICK_TRANS_LAST_START_AFTER.store(after as u64, Ordering::Release);
+    if quick_state(after) == ART_THREAD_STATE_NATIVE {
+        QUICK_TRANS_START_AFTER_NATIVE.fetch_add(1, Ordering::Relaxed);
+    } else {
+        QUICK_TRANS_START_AFTER_OTHER.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+unsafe fn quick_transition_to_runnable(bridge: ArtTransitionBridge, thread: *mut std::ffi::c_void, diag_slot: usize) {
+    let before = quick_read_state_and_flags(thread);
+    QUICK_TRANS_LAST_END_BEFORE.store(before as u64, Ordering::Release);
+    if quick_state(before) == ART_THREAD_STATE_NATIVE {
+        QUICK_TRANS_END_BEFORE_NATIVE.fetch_add(1, Ordering::Relaxed);
+    }
+    if quick_flags(before) != 0 {
+        QUICK_TRANS_END_FLAGS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    bridge.end(thread, diag_slot);
+
+    let after = quick_read_state_and_flags(thread);
+    QUICK_TRANS_LAST_END_AFTER.store(after as u64, Ordering::Release);
+    if quick_state(after) == ART_THREAD_STATE_RUNNABLE {
+        QUICK_TRANS_END_AFTER_RUNNABLE.fetch_add(1, Ordering::Relaxed);
+    } else {
+        QUICK_TRANS_END_AFTER_OTHER.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 unsafe fn raw_thread_to_native(thread: *mut std::ffi::c_void) {
     let state = (thread as usize + ART_THREAD_STATE_AND_FLAGS_OFFSET) as *mut u32;
@@ -401,18 +594,10 @@ unsafe fn raw_thread_to_native(thread: *mut std::ffi::c_void) {
 unsafe fn raw_thread_to_runnable(thread: *mut std::ffi::c_void, diag_slot: usize) {
     let state = (thread as usize + ART_THREAD_STATE_AND_FLAGS_OFFSET) as *mut u32;
     let cur = std::ptr::read_volatile(state);
-    let checked_flags = ART_THREAD_FLAG_SUSPEND_REQUEST
-        | ART_THREAD_FLAG_CHECKPOINT_REQUEST
-        | ART_THREAD_FLAG_EMPTY_CHECKPOINT_REQUEST
-        | ART_THREAD_FLAG_ACTIVE_SUSPEND_BARRIER;
 
     if (cur & ART_THREAD_FLAG_SUSPEND_REQUEST) != 0 {
         std::ptr::write_volatile(state, (cur & !ART_THREAD_STATE_MASK) | ART_THREAD_STATE_RUNNABLE);
-        if let Some(full_suspend_check) = resolve_full_suspend_check() {
-            quick_diag_stage(diag_slot, QUICK_STAGE_FULL_SUSPEND);
-            QUICK_FULL_SUSPEND_BEGIN.fetch_add(1, Ordering::Relaxed);
-            full_suspend_check(thread, false);
-            QUICK_FULL_SUSPEND_END.fetch_add(1, Ordering::Relaxed);
+        if run_quick_full_suspend_check(thread, diag_slot) {
             return;
         }
 
@@ -426,12 +611,225 @@ unsafe fn raw_thread_to_runnable(thread: *mut std::ffi::c_void, diag_slot: usize
         return;
     }
 
-    if (cur & checked_flags) == 0 {
+    if (cur & quick_suspend_checked_flags()) == 0 {
         std::ptr::write_volatile(state, (cur & !ART_THREAD_STATE_MASK) | ART_THREAD_STATE_RUNNABLE);
         return;
     }
 
     std::ptr::write_volatile(state, (cur & !ART_THREAD_STATE_MASK) | ART_THREAD_STATE_RUNNABLE);
+}
+
+#[inline]
+unsafe fn quick_suspend_flags_pending(thread: *mut std::ffi::c_void) -> bool {
+    if thread.is_null() {
+        return false;
+    }
+    let state = (thread as usize + ART_THREAD_STATE_AND_FLAGS_OFFSET) as *const u32;
+    let cur = std::ptr::read_volatile(state);
+    (cur & quick_suspend_checked_flags()) != 0
+}
+
+#[inline]
+fn quick_suspend_checked_flags() -> u32 {
+    ART_THREAD_FLAG_SUSPEND_REQUEST
+        | ART_THREAD_FLAG_CHECKPOINT_REQUEST
+        | ART_THREAD_FLAG_EMPTY_CHECKPOINT_REQUEST
+        | ART_THREAD_FLAG_ACTIVE_SUSPEND_BARRIER
+}
+
+unsafe fn run_quick_suspend_check_if_requested(thread: *mut std::ffi::c_void, diag_slot: usize) {
+    if quick_suspend_flags_pending(thread) {
+        run_quick_full_suspend_check(thread, diag_slot);
+    }
+}
+
+unsafe fn run_quick_full_suspend_check(thread: *mut std::ffi::c_void, diag_slot: usize) -> bool {
+    if let Some(full_suspend_check) = resolve_full_suspend_check() {
+        quick_diag_stage(diag_slot, QUICK_STAGE_FULL_SUSPEND);
+        QUICK_FULL_SUSPEND_BEGIN.fetch_add(1, Ordering::Relaxed);
+        full_suspend_check(thread, false);
+        QUICK_FULL_SUSPEND_END.fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lua_quick_callee_save_suspend_method() -> *mut std::ffi::c_void {
+    *ART_CALLEE_SAVE_SUSPEND_METHOD.get_or_init(|| unsafe { resolve_callee_save_suspend_method().unwrap_or(0) })
+        as *mut std::ffi::c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lua_quick_test_suspend_entrypoint() -> *mut std::ffi::c_void {
+    *ART_QUICK_TEST_SUSPEND_ENTRYPOINT.get_or_init(|| unsafe {
+        resolve_quick_entrypoint_address(current_art_thread_from_jni_env(), QUICK_TEST_SUSPEND_INDEX).unwrap_or(0)
+    }) as *mut std::ffi::c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lua_quick_top_quick_frame_offset() -> u64 {
+    crate::jsapi::java::art_controller::cached_thread_top_quick_frame_offset()
+        .map(|v| v as u64)
+        .unwrap_or(u64::MAX)
+}
+
+unsafe fn resolve_callee_save_suspend_method() -> Option<u64> {
+    const CALLEE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK: u32 = 5;
+    let runtime = resolve_art_runtime_instance()?;
+
+    type GetCalleeSaveMethodFn = unsafe extern "C" fn(*mut std::ffi::c_void, u32) -> *mut std::ffi::c_void;
+    let candidates = [
+        "_ZN3art7Runtime19GetCalleeSaveMethodENS_14CalleeSaveTypeE",
+        "_ZN3art7Runtime28GetCalleeSaveMethodUncheckedENS_14CalleeSaveTypeE",
+    ];
+    for sym_name in candidates {
+        let sym = crate::jsapi::module::libart_dlsym(sym_name);
+        if sym.is_null() {
+            continue;
+        }
+        let get_method: GetCalleeSaveMethodFn = std::mem::transmute(sym);
+        let method = get_method(runtime, CALLEE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK);
+        if !method.is_null() {
+            crate::jsapi::console::output_message(&format!(
+                "[lua quick] ART callee-save suspend method via {}: {:?}",
+                sym_name, method
+            ));
+            return Some(method as u64);
+        }
+    }
+
+    if let Some(method) = resolve_callee_save_suspend_method_from_quick_stub(runtime) {
+        return Some(method);
+    }
+
+    crate::jsapi::console::output_message("[lua quick] ART callee-save suspend method unavailable");
+    None
+}
+
+unsafe fn resolve_callee_save_suspend_method_from_quick_stub(runtime: *mut std::ffi::c_void) -> Option<u64> {
+    let mut entry = crate::jsapi::module::libart_dlsym("art_quick_test_suspend") as u64;
+    if entry == 0 {
+        entry = resolve_quick_entrypoint_address(current_art_thread_from_jni_env(), QUICK_TEST_SUSPEND_INDEX)?;
+    }
+
+    let runtime_addr = runtime as u64;
+    for i in 0..192usize {
+        let insn = std::ptr::read_unaligned((entry as usize + i * 4) as *const u32);
+        if (insn & 0xffc0_0000) != 0xf940_0000 {
+            continue;
+        }
+
+        let rt = insn & 0x1f;
+        let rn = (insn >> 5) & 0x1f;
+        if rt != rn {
+            continue;
+        }
+
+        let offset = (((insn >> 10) & 0xfff) as u64) * 8;
+        if offset < 5 * 8 || offset > 0x8000 {
+            continue;
+        }
+
+        let method = std::ptr::read_volatile((runtime_addr + offset) as *const u64) & 0x00ff_ffff_ffff_ffff;
+        if method == 0 || !looks_like_callee_save_method_array(runtime_addr, offset) {
+            continue;
+        }
+
+        crate::jsapi::console::output_message(&format!(
+            "[lua quick] ART callee-save suspend method from art_quick_test_suspend: method={:#x}, runtime_off=0x{:x}, stub={:#x}",
+            method, offset, entry
+        ));
+        return Some(method);
+    }
+
+    None
+}
+
+unsafe fn looks_like_callee_save_method_array(runtime: u64, suspend_method_offset: u64) -> bool {
+    let first = runtime + suspend_method_offset - 5 * 8;
+    let mut previous = 0u64;
+    for i in 0..6u64 {
+        let method = std::ptr::read_volatile((first + i * 8) as *const u64) & 0x00ff_ffff_ffff_ffff;
+        if method == 0 || (method & 0x3) != 0 {
+            return false;
+        }
+        if previous != 0 && method == previous {
+            return false;
+        }
+        previous = method;
+    }
+    true
+}
+
+unsafe fn resolve_art_runtime_instance() -> Option<*mut std::ffi::c_void> {
+    let instance_ptr = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime9instance_E");
+    if !instance_ptr.is_null() {
+        let raw = std::ptr::read_volatile(instance_ptr as *const u64) & 0x00ff_ffff_ffff_ffff;
+        if raw != 0 {
+            return Some(raw as *mut std::ffi::c_void);
+        }
+    }
+
+    let current_sym = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime7CurrentEv");
+    if !current_sym.is_null() {
+        let current: unsafe extern "C" fn() -> *mut std::ffi::c_void = std::mem::transmute(current_sym);
+        let runtime = current();
+        if !runtime.is_null() {
+            return Some(runtime);
+        }
+    }
+
+    crate::jsapi::console::output_message("[lua quick] ART Runtime::instance_ unavailable");
+    None
+}
+
+unsafe fn current_art_thread_from_jni_env() -> u64 {
+    let env = crate::jsapi::java::jni_core::get_thread_env().unwrap_or(std::ptr::null_mut());
+    if env.is_null() {
+        return 0;
+    }
+    std::ptr::read_volatile((env as usize + 8) as *const u64)
+}
+
+unsafe fn resolve_quick_entrypoint_address(thread_ptr: u64, index: usize) -> Option<u64> {
+    if thread_ptr == 0 || index >= QUICK_ENTRYPOINT_COUNT {
+        return None;
+    }
+
+    let max_off = QUICK_SCAN_LIMIT.saturating_sub(QUICK_ENTRYPOINT_COUNT * 8);
+    for off in (0..=max_off).step_by(8) {
+        let base = (thread_ptr as usize + off) as *const u64;
+        let start = std::ptr::read_volatile(base.add(QUICK_JNI_METHOD_START_INDEX));
+        let end = std::ptr::read_volatile(base.add(QUICK_JNI_METHOD_END_INDEX));
+        if !crate::jsapi::module::is_in_libart(start) || !crate::jsapi::module::is_in_libart(end) {
+            continue;
+        }
+        if off < 16 {
+            continue;
+        }
+        let prev0 = std::ptr::read_volatile((thread_ptr as usize + off - 16) as *const u64);
+        let prev1 = std::ptr::read_volatile((thread_ptr as usize + off - 8) as *const u64);
+        if !crate::jsapi::module::is_in_libart(prev0) || !crate::jsapi::module::is_in_libart(prev1) {
+            continue;
+        }
+
+        let mut libart_ptrs = 0usize;
+        for i in 0..QUICK_ENTRYPOINT_COUNT {
+            let p = std::ptr::read_volatile(base.add(i));
+            if crate::jsapi::module::is_in_libart(p) {
+                libart_ptrs += 1;
+            }
+        }
+        if libart_ptrs < QUICK_MIN_LIBART_POINTERS {
+            continue;
+        }
+
+        let entry = std::ptr::read_volatile(base.add(index));
+        return crate::jsapi::module::is_in_libart(entry).then_some(entry);
+    }
+    None
 }
 
 unsafe fn resolve_full_suspend_check() -> Option<ArtFullSuspendCheckFn> {
@@ -469,12 +867,6 @@ unsafe fn resolve_quick_entrypoint_transition(thread_ptr: u64) -> Option<ArtTran
     if thread_ptr == 0 {
         return None;
     }
-
-    const QUICK_ENTRYPOINT_COUNT: usize = 174;
-    const QUICK_JNI_METHOD_START_INDEX: usize = 45;
-    const QUICK_JNI_METHOD_END_INDEX: usize = 46;
-    const QUICK_SCAN_LIMIT: usize = 16384;
-    const QUICK_MIN_LIBART_POINTERS: usize = 40;
 
     let max_off = QUICK_SCAN_LIMIT.saturating_sub(QUICK_ENTRYPOINT_COUNT * 8);
     let mut best_off = 0usize;
@@ -729,6 +1121,7 @@ pub unsafe extern "C" fn lua_hook_dispatch_from_quick(
     }
 
     let _lua_callback_guard = super::LuaCallbackGuard::enter();
+    let _quick_timing_guard = QuickCallbackTimingGuard::enter();
     let _in_flight = InFlightJavaHookGuard::enter();
     let _scope = JavaHookCallbackScope::enter();
 
@@ -740,6 +1133,13 @@ pub unsafe extern "C" fn lua_hook_dispatch_from_quick(
     super::api::clear_fast_orig_requested();
     super::api::clear_quick_orig_result();
     super::api::set_current_env(std::ptr::null());
+
+    let art_native = ArtNativeTransition::enter_from_quick(ctx_ptr, quick_diag.slot);
+    if art_native.is_some() {
+        let env = crate::jsapi::java::jni_core::get_thread_env().unwrap_or(std::ptr::null_mut());
+        super::api::set_current_raw_mirror_env(env as *const std::ffi::c_void);
+    }
+    quick_diag.stage(QUICK_STAGE_NATIVE_READY);
 
     let tls = match super::get_thread_lua_state() {
         Some(t) => t,
@@ -781,13 +1181,6 @@ pub unsafe extern "C" fn lua_hook_dispatch_from_quick(
         quick_orig_precall,
         local_refs: &mut local_refs,
     };
-
-    let art_native = ArtNativeTransition::enter_from_quick(ctx_ptr, quick_diag.slot);
-    if art_native.is_some() {
-        let env = crate::jsapi::java::jni_core::get_thread_env().unwrap_or(std::ptr::null_mut());
-        super::api::set_current_raw_mirror_env(env as *const std::ffi::c_void);
-    }
-    quick_diag.stage(QUICK_STAGE_NATIVE_READY);
 
     let L = tls.state.as_ptr();
     lua_ffi::lua_rawgeti(L, lua_ffi::LUA_REGISTRYINDEX, func_ref as lua_ffi::lua_Integer);
@@ -1382,6 +1775,10 @@ pub(super) unsafe extern "C" fn lua_art_checkpoint_hook(
     _L: *mut super::ffi::lua_State,
     _ar: *mut super::ffi::lua_Debug,
 ) {
+    if service_current_quick_suspend_if_requested() {
+        return;
+    }
+
     let env = super::api::get_current_env();
     if !env.is_null() {
         jni_safepoint(env as crate::jsapi::java::jni_core::JniEnv);

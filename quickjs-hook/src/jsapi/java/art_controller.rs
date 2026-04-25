@@ -1056,8 +1056,21 @@ pub(crate) fn get_interpreter_bridge() -> u64 {
 /// 返回 1 = 正常路由到 replacement，返回 0 = 跳过（callOriginal bypass 或 stack 递归 或 JS engine 繁忙）。
 #[no_mangle]
 pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
+    let original_for_quick = hook_ffi::hook_art_router_table_lookup_original(replacement);
+    if original_for_quick != 0 && crate::fast_hook::is_fast_hook(original_for_quick) {
+        let stack = get_bypass_stack();
+        if !stack.is_empty() {
+            for &bypassed in stack.iter() {
+                if bypassed == original_for_quick {
+                    return 0;
+                }
+            }
+        }
+        return if should_replace_for_stack(replacement) { 1 } else { 0 };
+    }
+
     // Lua hook 快速路径: 无 JS engine 锁, 无 cooldown gate, 每次都执行
-    let original_for_lua = hook_ffi::hook_art_router_table_lookup_original(replacement);
+    let original_for_lua = original_for_quick;
     if original_for_lua != 0 && crate::lua::is_lua_hook(original_for_lua) {
         if !should_sample_original_method(original_for_lua) {
             return 0;
@@ -1138,6 +1151,34 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
 /// 上次见到的非空 ArtMethod* (PrettyMethod 防护用)
 static LAST_SEEN_ART_METHOD: AtomicU64 = AtomicU64::new(0);
 
+fn stack_replacement_source(method: u64) -> Option<u64> {
+    if method == 0 {
+        return None;
+    }
+    let guard = super::callback::JAVA_HOOK_REGISTRY.lock().ok()?;
+    let registry = guard.as_ref()?;
+    for data in registry.values() {
+        match &data.hook_type {
+            super::callback::HookType::Replaced { replacement_addr, .. } if *replacement_addr as u64 == method => {
+                return Some(data.art_method)
+            }
+            super::callback::HookType::Quick {
+                replacement_addr,
+                declaring_class_source,
+                ..
+            } if *replacement_addr as u64 == method => {
+                return Some(if *declaring_class_source != 0 {
+                    *declaring_class_source
+                } else {
+                    data.art_method
+                });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// PrettyMethod on_enter 回调: 当 method (x0/this) 为 NULL 时替换为上次见到的非空 method。
 /// 对标 Frida fixupArtQuickDeliverExceptionBug: QuickDeliverException 中
 /// native 线程无 Java frame 时 method==NULL → PrettyMethod(NULL) → SIGSEGV。
@@ -1154,14 +1195,19 @@ unsafe extern "C" fn on_pretty_method_enter(ctx_ptr: *mut hook_ffi::HookContext,
             ctx.x[0] = last;
         }
     } else {
-        let original = hook_ffi::hook_art_router_table_lookup_original(method);
-        if original != 0 {
-            // replacement ArtMethod is only a native stack-walk sentinel.  PrettyMethod
-            // must parse the real method, otherwise ART may follow stale clone metadata.
-            ctx.x[0] = original;
-            LAST_SEEN_ART_METHOD.store(original, Ordering::Relaxed);
+        if let Some(source) = stack_replacement_source(method) {
+            // Heap replacement/sentinel ArtMethods are not GC roots. PrettyMethod
+            // must parse the real source method so it never follows stale clone metadata.
+            ctx.x[0] = source;
+            LAST_SEEN_ART_METHOD.store(source, Ordering::Relaxed);
         } else {
-            LAST_SEEN_ART_METHOD.store(method, Ordering::Relaxed);
+            let original = hook_ffi::hook_art_router_table_lookup_original(method);
+            if original != 0 {
+                ctx.x[0] = original;
+                LAST_SEEN_ART_METHOD.store(original, Ordering::Relaxed);
+            } else {
+                LAST_SEEN_ART_METHOD.store(method, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -1210,9 +1256,17 @@ unsafe extern "C" fn on_get_oat_quick_method_header(
             GET_OAT_HOOK_POOL_LAST_METHOD.store(method, Ordering::Relaxed);
             GET_OAT_HOOK_POOL_LAST_PC.store(pc, Ordering::Relaxed);
         }
+
+        // Any PC inside rustfrida's exec pool belongs to a trampoline/router,
+        // not to ART-owned quick code. Let StackVisitor treat it as a native
+        // frame; asking the real ArtMethod for an OAT header with a pool PC can
+        // pair unrelated method metadata with our trampoline and crash in
+        // PrettyMethod during SIGQUIT/ANR stack dumping.
+        ctx.x[0] = 0;
+        return;
     }
 
-    if is_replacement_method(method) {
+    if is_replacement_method(method) || stack_replacement_source(method).is_some() {
         // replacement method → NULL (让 StackVisitor 走 IsNative 兜底)
         ctx.x[0] = 0;
     } else {
@@ -1273,11 +1327,22 @@ unsafe fn synchronize_replacement_methods() {
         // method, so its declaring_class_/dex metadata must not be overwritten with
         // the hooked method's class.
         {
-            let declaring_class = std::ptr::read_volatile(art_method as *const u32);
-            let replacement_addr = match &data.hook_type {
-                HookType::Replaced { replacement_addr, .. } => *replacement_addr,
-                HookType::Quick { .. } => 0,
+            let (replacement_addr, declaring_class_source) = match &data.hook_type {
+                HookType::Replaced { replacement_addr, .. } => (*replacement_addr, data.art_method),
+                HookType::Quick {
+                    replacement_addr,
+                    declaring_class_source,
+                    ..
+                } => (
+                    *replacement_addr,
+                    if *declaring_class_source != 0 {
+                        *declaring_class_source
+                    } else {
+                        data.art_method
+                    },
+                ),
             };
+            let declaring_class = std::ptr::read_volatile(declaring_class_source as *const u32);
             if replacement_addr != 0 {
                 std::ptr::write_volatile(replacement_addr as *mut u32, declaring_class);
             }

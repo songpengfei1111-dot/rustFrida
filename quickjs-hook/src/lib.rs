@@ -27,6 +27,7 @@
 
 mod completion;
 pub mod context;
+pub mod fast_hook;
 pub mod ffi;
 pub mod jsapi;
 pub mod lua;

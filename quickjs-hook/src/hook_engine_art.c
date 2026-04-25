@@ -22,6 +22,11 @@ volatile uint64_t g_art_router_quick_hit_count = 0;
 volatile uint64_t g_art_router_quick_pass_count = 0;
 volatile uint64_t g_art_router_quick_callback_count = 0;
 volatile uint64_t g_art_router_quick_skip_count = 0;
+volatile uint64_t g_art_router_quick_callee_save_frame_count = 0;
+volatile uint64_t g_art_router_quick_callee_save_method = 0;
+volatile uint64_t g_art_router_quick_top_quick_frame_offset = 0;
+volatile uint64_t g_art_router_quick_test_suspend_count = 0;
+volatile uint64_t g_art_router_quick_test_suspend_entrypoint = 0;
 volatile uint64_t g_art_router_replacement_hit_count = 0;
 volatile uint64_t g_art_router_do_call_table_hit_count = 0;
 volatile uint64_t g_art_router_last_do_call_x0 = 0;
@@ -208,6 +213,8 @@ void hook_art_router_reset_debug(void) {
     g_art_router_quick_pass_count = 0;
     g_art_router_quick_callback_count = 0;
     g_art_router_quick_skip_count = 0;
+    g_art_router_quick_callee_save_frame_count = 0;
+    g_art_router_quick_test_suspend_count = 0;
     g_art_router_replacement_hit_count = 0;
     g_art_router_do_call_table_hit_count = 0;
     g_art_router_last_do_call_x0 = 0;
@@ -224,7 +231,12 @@ void hook_art_router_get_route_stats(uint64_t* quick_hits,
                                      uint64_t* last_do_call_x0,
                                      uint64_t* quick_pass_hits,
                                      uint64_t* quick_callback_calls,
-                                     uint64_t* quick_skip_hits) {
+                                     uint64_t* quick_skip_hits,
+                                     uint64_t* quick_callee_save_frames,
+                                     uint64_t* quick_callee_save_method,
+                                     uint64_t* quick_top_quick_frame_offset,
+                                     uint64_t* quick_test_suspend_calls,
+                                     uint64_t* quick_test_suspend_entrypoint) {
     if (quick_hits)          *quick_hits          = g_art_router_quick_hit_count;
     if (replacement_hits)    *replacement_hits    = g_art_router_replacement_hit_count;
     if (do_call_table_hits)  *do_call_table_hits  = g_art_router_do_call_table_hit_count;
@@ -232,6 +244,11 @@ void hook_art_router_get_route_stats(uint64_t* quick_hits,
     if (quick_pass_hits)     *quick_pass_hits     = g_art_router_quick_pass_count;
     if (quick_callback_calls)*quick_callback_calls= g_art_router_quick_callback_count;
     if (quick_skip_hits)     *quick_skip_hits     = g_art_router_quick_skip_count;
+    if (quick_callee_save_frames) *quick_callee_save_frames = g_art_router_quick_callee_save_frame_count;
+    if (quick_callee_save_method) *quick_callee_save_method = g_art_router_quick_callee_save_method;
+    if (quick_top_quick_frame_offset) *quick_top_quick_frame_offset = g_art_router_quick_top_quick_frame_offset;
+    if (quick_test_suspend_calls) *quick_test_suspend_calls = g_art_router_quick_test_suspend_count;
+    if (quick_test_suspend_entrypoint) *quick_test_suspend_entrypoint = g_art_router_quick_test_suspend_entrypoint;
 }
 
 /* ============================================================================
@@ -254,6 +271,12 @@ void hook_art_router_get_route_stats(uint64_t* quick_hits,
 #define ROUTER_SAVED_X20_OFF       136
 #define ROUTER_SAVED_X30_OFF       216
 #define ROUTER_FRAME_RETURN_PC_OFF 216
+
+#define ART_SAVE_EVERYTHING_FRAME_SIZE 512
+#define ART_SAVE_EVERYTHING_OLD_TOP_OFF 8
+#define QUICK_PREORIG_RET_REG 16
+#define ART_THREAD_STATE_AND_FLAGS_OFF 0
+#define ART_QUICK_SUSPEND_POLL_FLAGS 0x3f
 
 /* TPIDR_EL0 system register encoding */
 #define SYSREG_TPIDR_EL0 0xDE82
@@ -329,7 +352,7 @@ volatile uint64_t g_fast_orig_frame_sp = 0;
 
 static __thread HookContext g_art_router_tls_ctx;
 
-static HookContext* art_router_prepare_quick_context(void* frame_sp) {
+static HookContext* art_router_prepare_quick_context(void* frame_sp, void* save_frame_sp) {
     uint8_t* sp = (uint8_t*)frame_sp;
     HookContext* ctx = &g_art_router_tls_ctx;
     uint64_t thread = 0;
@@ -351,7 +374,7 @@ static HookContext* art_router_prepare_quick_context(void* frame_sp) {
     ctx->sp = (uint64_t)(sp + ROUTER_FRAME_SIZE);
     ctx->pc = 0;
     ctx->nzcv = 0;
-    ctx->trampoline = NULL;
+    ctx->trampoline = save_frame_sp;
     for (int i = 0; i < 8; i++) {
         ctx->d[i] = *(uint64_t*)(sp + ROUTER_FRAME_FP_OFF + i * 8);
     }
@@ -362,7 +385,7 @@ static HookContext* art_router_prepare_quick_context(void* frame_sp) {
 static HookContext* art_router_prepare_quick_context_preorig(void* frame_sp,
                                                              uint64_t ret_x0,
                                                              double ret_d0) {
-    HookContext* ctx = art_router_prepare_quick_context(frame_sp);
+    HookContext* ctx = art_router_prepare_quick_context(frame_sp, NULL);
     uint64_t ret_d0_bits = 0;
     memcpy(&ret_d0_bits, &ret_d0, sizeof(ret_d0_bits));
     ctx->x[16] = ret_x0;
@@ -495,6 +518,25 @@ static void emit_art_router_restore_all(Arm64Writer* w) {
     /* thunk-level dec 废弃 (见 prologue 注释) */
 }
 
+static void emit_art_router_restore_all_with_return_x0(Arm64Writer* w, Arm64Reg return_reg) {
+    for (int i = 0; i < 8; i += 2) {
+        arm64_writer_put_fp_ldp_offset(w, i, i + 1, ARM64_REG_SP, ROUTER_FRAME_FP_OFF + i * 8);
+    }
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X1, ARM64_REG_X2, ARM64_REG_SP, 80, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X3, ARM64_REG_X4, ARM64_REG_SP, 96, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X5, ARM64_REG_X6, ARM64_REG_SP, 112, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X7, ARM64_REG_X20, ARM64_REG_SP, 128, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22, ARM64_REG_SP, 144, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24, ARM64_REG_SP, 160, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26, ARM64_REG_SP, 176, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP, 192, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_X30, ARM64_REG_SP, 208, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ROUTER_FRAME_SIZE);
+    if (return_reg != ARM64_REG_X0) {
+        arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, return_reg);
+    }
+}
+
 /* Debug: store X0 to g_art_router_last_x0, increment g_art_router_miss_count */
 static void emit_art_router_debug_counters(Arm64Writer* w) {
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)&g_art_router_last_x0);
@@ -523,8 +565,164 @@ static void emit_art_router_inc_counter(Arm64Writer* w, volatile uint64_t* count
 /* C-callable stack check function (implemented in Rust art_controller.rs).
  * Returns 1 = normal routing, 0 = skip (callOriginal recursion). */
 extern int art_router_stack_check(uint64_t replacement);
+extern void* lua_quick_callee_save_suspend_method(void);
+extern void* lua_quick_test_suspend_entrypoint(void);
+extern uint64_t lua_quick_top_quick_frame_offset(void);
 
 static void emit_restore_args_only(Arm64Writer* w);
+static void emit_save_args_only(Arm64Writer* w);
+static void emit_restore_quick_callee_without_lr(Arm64Writer* w);
+static void emit_art_router_inc_counter(Arm64Writer* w, volatile uint64_t* counter);
+static int resolve_art_callee_save_frame_params(uint64_t* method_out, uint64_t* top_quick_off_out);
+static int emit_art_quick_callee_save_frame_push(Arm64Writer* w);
+static void emit_art_quick_callee_save_frame_patch_router_callees(Arm64Writer* w);
+static void emit_art_quick_callee_save_frame_pop(Arm64Writer* w);
+
+static int resolve_art_quick_test_suspend_entrypoint(uint64_t* entrypoint_out) {
+    static uint64_t cached_entrypoint = 0;
+    static int cached = 0;
+
+    if (!cached) {
+        cached = 1;
+        cached_entrypoint = (uint64_t)lua_quick_test_suspend_entrypoint();
+        g_art_router_quick_test_suspend_entrypoint = cached_entrypoint;
+        hook_log("[art_router] quick test-suspend entrypoint: %p", (void*)cached_entrypoint);
+    }
+
+    if (cached_entrypoint == 0) {
+        return 0;
+    }
+    *entrypoint_out = cached_entrypoint;
+    return 1;
+}
+
+static void emit_art_quick_test_suspend_poll(Arm64Writer* w) {
+    (void)w;
+}
+
+static int resolve_art_callee_save_frame_params(uint64_t* method_out, uint64_t* top_quick_off_out) {
+    static uint64_t cached_method = 0;
+    static uint64_t cached_top_quick_off = 0;
+    static int cached = 0;
+
+    if (!cached) {
+        cached = 1;
+        cached_method = (uint64_t)lua_quick_callee_save_suspend_method();
+        cached_top_quick_off = lua_quick_top_quick_frame_offset();
+        g_art_router_quick_callee_save_method = cached_method;
+        g_art_router_quick_top_quick_frame_offset = cached_top_quick_off;
+        hook_log("[art_router] quick callee-save params: method=%p top_quick_off=0x%llx",
+                 (void*)cached_method, (unsigned long long)cached_top_quick_off);
+    }
+
+    if (cached_method == 0 || cached_top_quick_off == UINT64_MAX) {
+        return 0;
+    }
+    *method_out = cached_method;
+    *top_quick_off_out = cached_top_quick_off;
+    return 1;
+}
+
+static int emit_art_quick_callee_save_frame_push(Arm64Writer* w) {
+    uint64_t method = 0;
+    uint64_t top_quick_off = 0;
+    if (!resolve_art_callee_save_frame_params(&method, &top_quick_off)) {
+        hook_log("[art_router] quick callee-save frame disabled: method/top_quick offset unavailable");
+        return 0;
+    }
+
+    arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ART_SAVE_EVERYTHING_FRAME_SIZE);
+
+    for (int i = 0; i < 32; i += 2) {
+        arm64_writer_put_fp_stp_offset(w, (uint32_t)i, (uint32_t)(i + 1),
+                                       ARM64_REG_SP, 16 + i * 8);
+    }
+
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X1, ARM64_REG_SP, 272, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X2, ARM64_REG_X3, ARM64_REG_SP, 288, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X4, ARM64_REG_X5, ARM64_REG_SP, 304, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X6, ARM64_REG_X7, ARM64_REG_SP, 320, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X8, ARM64_REG_X9, ARM64_REG_SP, 336, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X10, ARM64_REG_X11, ARM64_REG_SP, 352, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X12, ARM64_REG_X13, ARM64_REG_SP, 368, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X14, ARM64_REG_X15, ARM64_REG_SP, 384, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, ARM64_REG_SP, 400, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X19, ARM64_REG_X20, ARM64_REG_SP, 416, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22, ARM64_REG_SP, 432, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24, ARM64_REG_SP, 448, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26, ARM64_REG_SP, 464, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP, 480, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_LR, ARM64_REG_SP, 496, ARM64_INDEX_SIGNED_OFFSET);
+
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, method);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
+
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_X19, top_quick_off);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 0);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, ART_SAVE_EVERYTHING_OLD_TOP_OFF);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_SP, ARM64_REG_X16, 0);
+
+    emit_art_router_inc_counter(w, &g_art_router_quick_callee_save_frame_count);
+    return 1;
+}
+
+/* After pushing the SaveEverything frame, overwrite the ART quick callee-save
+ * spill slots with the original caller values saved in the router frame. Keep
+ * live x20-x29 untouched because the router uses them for its own state while
+ * setting up the native callback.
+ */
+static void emit_art_quick_callee_save_frame_patch_router_callees(Arm64Writer* w) {
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_SP, ART_SAVE_EVERYTHING_FRAME_SIZE);
+
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 136);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 424);
+
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X15, ARM64_REG_X16, 144, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X15, ARM64_REG_SP, 432, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X15, ARM64_REG_X16, 160, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X15, ARM64_REG_SP, 448, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X15, ARM64_REG_X16, 176, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X15, ARM64_REG_SP, 464, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X15, ARM64_REG_X16, 192, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X15, ARM64_REG_SP, 480, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 208);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 496);
+}
+
+static void emit_art_quick_callee_save_frame_pop(Arm64Writer* w) {
+    uint64_t method = 0;
+    uint64_t top_quick_off = 0;
+    if (!resolve_art_callee_save_frame_params(&method, &top_quick_off)) {
+        return;
+    }
+    (void)method;
+
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_X19, top_quick_off);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, ART_SAVE_EVERYTHING_OLD_TOP_OFF);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 0);
+
+    for (int i = 0; i < 32; i += 2) {
+        arm64_writer_put_fp_ldp_offset(w, (uint32_t)i, (uint32_t)(i + 1),
+                                       ARM64_REG_SP, 16 + i * 8);
+    }
+
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X1, ARM64_REG_SP, 272, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X2, ARM64_REG_X3, ARM64_REG_SP, 288, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X4, ARM64_REG_X5, ARM64_REG_SP, 304, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X6, ARM64_REG_X7, ARM64_REG_SP, 320, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X8, ARM64_REG_X9, ARM64_REG_SP, 336, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X10, ARM64_REG_X11, ARM64_REG_SP, 352, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X12, ARM64_REG_X13, ARM64_REG_SP, 368, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X14, ARM64_REG_X15, ARM64_REG_SP, 384, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, ARM64_REG_SP, 400, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X19, ARM64_REG_X20, ARM64_REG_SP, 416, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22, ARM64_REG_SP, 432, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24, ARM64_REG_SP, 448, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26, ARM64_REG_SP, 464, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP, 480, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_LR, ARM64_REG_SP, 496, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ART_SAVE_EVERYTHING_FRAME_SIZE);
+}
 
 static void emit_art_router_quick_callback_path(Arm64Writer* w, uint64_t lbl_quick,
                                                  uint64_t lbl_not_found,
@@ -574,17 +772,52 @@ static void emit_art_router_quick_callback_path(Arm64Writer* w, uint64_t lbl_qui
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X20, 24); /* quick_callback */
     arm64_writer_put_cbz_reg_label(w, ARM64_REG_X16, lbl_call_original);
     emit_art_router_inc_counter(w, &g_art_router_quick_callback_count);
-    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_SP);
+
+    /* Build a real ART kSaveEverythingForSuspendCheck frame around the whole
+     * callback. Before pushing it, restore the original quick-call arguments
+     * so GC sees the Java object roots in the ART-defined spill slots. */
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X20, ARM64_REG_SP, ROUTER_FRAME_PADDING_OFF);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 0);
+    emit_restore_args_only(w);
+    emit_art_quick_test_suspend_poll(w);
+    int has_callee_save_frame = emit_art_quick_callee_save_frame_push(w);
+    if (has_callee_save_frame) {
+        emit_art_quick_callee_save_frame_patch_router_callees(w);
+    }
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X20, ARM64_REG_SP,
+                                        (has_callee_save_frame ? ART_SAVE_EVERYTHING_FRAME_SIZE : 0) +
+                                            ROUTER_FRAME_PADDING_OFF);
+
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X0, ARM64_REG_SP,
+                                     has_callee_save_frame ? ART_SAVE_EVERYTHING_FRAME_SIZE : 0);
+    if (has_callee_save_frame) {
+        arm64_writer_put_mov_reg_reg(w, ARM64_REG_X1, ARM64_REG_SP);
+    } else {
+        arm64_writer_put_mov_reg_reg(w, ARM64_REG_X1, ARM64_REG_XZR);
+    }
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)art_router_prepare_quick_context);
     arm64_writer_put_blr_reg(w, ARM64_REG_X17);
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X22, ARM64_REG_X0);
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X1, ARM64_REG_X20, 32); /* quick_user_data */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X20, 24); /* quick_callback */
     arm64_writer_put_blr_reg(w, ARM64_REG_X16);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X22, ARM64_REG_SP,
+                                        (has_callee_save_frame ? ART_SAVE_EVERYTHING_FRAME_SIZE : 0) +
+                                            ROUTER_FRAME_PADDING_OFF);
+    if (has_callee_save_frame) {
+        emit_art_quick_callee_save_frame_pop(w);
+    }
 
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X22, ARM64_REG_SP, ROUTER_FRAME_PADDING_OFF);
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X22, 344);
     arm64_writer_put_cbnz_reg_label(w, ARM64_REG_X0, lbl_return_replacement);
 
     arm64_writer_put_label(w, lbl_call_original);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X20, ARM64_REG_SP, ROUTER_FRAME_PADDING_OFF);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 0);
+    emit_restore_args_only(w);
+    emit_art_quick_test_suspend_poll(w);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X20, ARM64_REG_SP, ROUTER_FRAME_PADDING_OFF);
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X20, 0);
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
     emit_art_router_restore_all(w);
@@ -602,10 +835,14 @@ static void emit_art_router_quick_callback_path(Arm64Writer* w, uint64_t lbl_qui
      * our fake header for wwb_hook_pool PCs and ReferenceMapVisitor has no
      * object parameters to scan from the synthetic router frame. */
     emit_restore_args_only(w);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 0);
+    emit_art_quick_test_suspend_poll(w);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X20, ARM64_REG_SP, ROUTER_FRAME_PADDING_OFF);
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X20, 8);
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 0);
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, trampoline_target);
+    emit_restore_quick_callee_without_lr(w);
     arm64_writer_put_blr_reg(w, ARM64_REG_X16);
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X1, ARM64_REG_X0);
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_SP);
@@ -618,9 +855,43 @@ static void emit_art_router_quick_callback_path(Arm64Writer* w, uint64_t lbl_qui
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X20, 24); /* quick_callback */
     arm64_writer_put_cbz_reg_label(w, ARM64_REG_X16, lbl_preorig_no_callback);
     emit_art_router_inc_counter(w, &g_art_router_quick_callback_count);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 0);
+    emit_restore_args_only(w);
+    /* Pre-orig object returns live only in the native HookContext until Lua
+     * asks for self:orig(). Publish the raw return in SaveEverything.x0 so a
+     * moving GC can update it while the Lua callback runs. The ArtMethod* for
+     * this frame is written directly at [sp], so x0 does not need to hold it. */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X22, QUICK_PREORIG_RET_REG * 8);
+    emit_art_quick_test_suspend_poll(w);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X22, QUICK_PREORIG_RET_REG * 8);
+    int has_preorig_callee_save_frame = emit_art_quick_callee_save_frame_push(w);
+    if (has_preorig_callee_save_frame) {
+        emit_art_quick_callee_save_frame_patch_router_callees(w);
+    }
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X20, ARM64_REG_SP,
+                                        (has_preorig_callee_save_frame ? ART_SAVE_EVERYTHING_FRAME_SIZE : 0) +
+                                            ROUTER_FRAME_PADDING_OFF);
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_X22);
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X1, ARM64_REG_X20, 32); /* quick_user_data */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X20, 24); /* quick_callback */
     arm64_writer_put_blr_reg(w, ARM64_REG_X16);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X22, ARM64_REG_SP,
+                                        (has_preorig_callee_save_frame ? ART_SAVE_EVERYTHING_FRAME_SIZE : 0) +
+                                            ROUTER_FRAME_PADDING_OFF);
+    if (has_preorig_callee_save_frame) {
+        emit_art_quick_callee_save_frame_pop(w);
+    }
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X22, ARM64_REG_SP, ROUTER_FRAME_PADDING_OFF);
+    if (has_preorig_callee_save_frame) {
+        uint64_t lbl_preorig_ret_not_orig = arm64_writer_new_label_id(w);
+        arm64_writer_put_mov_reg_reg(w, ARM64_REG_X23, ARM64_REG_X0);
+        arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X24, ARM64_REG_X22, 0);
+        arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X22, QUICK_PREORIG_RET_REG * 8);
+        arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X24, ARM64_REG_X25);
+        arm64_writer_put_b_cond_label(w, ARM64_COND_NE, lbl_preorig_ret_not_orig);
+        arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X22, 0);
+        arm64_writer_put_label(w, lbl_preorig_ret_not_orig);
+    }
     arm64_writer_put_b_label(w, lbl_return_replacement);
 
     arm64_writer_put_label(w, lbl_preorig_no_callback);
@@ -629,11 +900,10 @@ static void emit_art_router_quick_callback_path(Arm64Writer* w, uint64_t lbl_qui
     arm64_writer_put_b_label(w, lbl_return_replacement);
 
     arm64_writer_put_label(w, lbl_return_replacement);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X22, 0);
-    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X22, 0);
     arm64_writer_put_fp_ldp_offset(w, 0, 1, ARM64_REG_X22, 280);
     arm64_writer_put_fp_stp_offset(w, 0, 1, ARM64_REG_SP, ROUTER_FRAME_FP_OFF);
-    emit_art_router_restore_all(w);
+    emit_art_router_restore_all_with_return_x0(w, ARM64_REG_X16);
     arm64_writer_put_ret(w);
 }
 
@@ -735,6 +1005,34 @@ static void emit_restore_args_only(Arm64Writer* w) {
     arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X3, ARM64_REG_X4, ARM64_REG_SP, 96, ARM64_INDEX_SIGNED_OFFSET);
     arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X5, ARM64_REG_X6, ARM64_REG_SP, 112, ARM64_INDEX_SIGNED_OFFSET);
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X7, ARM64_REG_SP, 128);
+}
+
+/* Save quick argument regs back into the router frame after ART suspend poll.
+ * x0 is the ArtMethod*, not a Java object argument; keep SP+0 under caller
+ * control because some paths publish a native sentinel method there. */
+static void emit_save_args_only(Arm64Writer* w) {
+    for (int i = 0; i < 8; i += 2) {
+        arm64_writer_put_fp_stp_offset(w, i, i + 1, ARM64_REG_SP,
+            ROUTER_FRAME_FP_OFF + i * 8);
+    }
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X1, ARM64_REG_X2, ARM64_REG_SP, 80, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X3, ARM64_REG_X4, ARM64_REG_SP, 96, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X5, ARM64_REG_X6, ARM64_REG_SP, 112, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X7, ARM64_REG_SP, 128);
+}
+
+/* Restore ART quick callee-save state without touching LR or SP.
+ * x20/x21 are special in ART quick code (marking/suspend registers on many
+ * builds). They must contain the caller's values when we either run the
+ * original quick method or expose a SaveEverything frame to ART stack walking.
+ */
+static void emit_restore_quick_callee_without_lr(Arm64Writer* w) {
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X20, ARM64_REG_SP, 136);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22, ARM64_REG_SP, 144, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24, ARM64_REG_SP, 160, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26, ARM64_REG_SP, 176, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP, 192, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_SP, 208);
 }
 
 /* Restore callee-saved regs (x20-x29, LR) from frame + pop frame.
@@ -1177,7 +1475,7 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
 
     /* Allocate thunk (router code — larger than default).
      * hook_alloc_near 按 ±128MB → ±4GB → 任意 三层分配。 */
-    size_t art_thunk_alloc = 4096;
+    size_t art_thunk_alloc = 8192;
     if (!entry->thunk || entry->thunk_alloc < art_thunk_alloc) {
         entry->thunk = hook_alloc_near(art_thunk_alloc, target);
         entry->thunk_alloc = art_thunk_alloc;
@@ -1320,9 +1618,15 @@ void hook_art_synchronize_replacement_methods(
         if (original == 0) break;
         if (replacement == 0) continue;
 
-        /* 1. declaring_class_ 同步 */
-        uint32_t declaring_class = *(volatile uint32_t*)(uintptr_t)original;
-        *(volatile uint32_t*)(uintptr_t)replacement = declaring_class;
+        /* 1. declaring_class_ 同步.
+         * Quick callback entries use a standalone native sentinel ArtMethod.
+         * Its dex/method metadata must stay paired with its original declaring
+         * class; copying the hooked method's class makes ART PrettyMethod read
+         * unrelated dex data during stack dumps. */
+        if (g_art_router_table[i].mode == 0) {
+            uint32_t declaring_class = *(volatile uint32_t*)(uintptr_t)original;
+            *(volatile uint32_t*)(uintptr_t)replacement = declaring_class;
+        }
 
         /* 2. nterp → interpreter_bridge 降级 */
         if (nterp_entrypoint != 0 && quickcode_offset != 0) {

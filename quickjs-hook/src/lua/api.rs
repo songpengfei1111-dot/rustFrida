@@ -9,9 +9,11 @@ const REF_KIND_JNI_LOCAL: u8 = 1;
 const REF_KIND_RAW_MIRROR: u8 = 2;
 static CALLBACK_LOG_MARK: AtomicU64 = AtomicU64::new(0);
 static JNEW_DIAG_BITS: AtomicU64 = AtomicU64::new(0);
+static ARRAY_DIAG_BITS: AtomicU64 = AtomicU64::new(0);
 static SHARED_VALUES: OnceLock<RwLock<HashMap<String, SharedValue>>> = OnceLock::new();
 static SHARED_COUNTERS: OnceLock<RwLock<HashMap<String, Arc<AtomicI64>>>> = OnceLock::new();
 static JSTRING_GLOBAL_CACHE: OnceLock<RwLock<HashMap<Vec<u8>, usize>>> = OnceLock::new();
+static BOXED_VALUE_OF_CACHE: OnceLock<RwLock<HashMap<&'static str, BoxedValueOfCache>>> = OnceLock::new();
 static ART_CARD_TABLE_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static QUICK_ENTRYPOINTS_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static STRING_CLASS_MIRROR: AtomicUsize = AtomicUsize::new(0);
@@ -91,6 +93,12 @@ enum SharedValue {
     Ptr(u64),
 }
 
+#[derive(Clone, Copy)]
+struct BoxedValueOfCache {
+    class_global: usize,
+    method_id: usize,
+}
+
 // 当前 callback 线程的 JNIEnv 和引用形态 (JNI local ref / quick raw mirror)。
 std::thread_local! {
     static CURRENT_ENV: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -136,7 +144,7 @@ pub(crate) fn set_current_local_refs(local_refs: *mut Vec<*mut std::ffi::c_void>
     CURRENT_LOCAL_REFS.with(|c| c.set(local_refs as usize));
 }
 
-unsafe fn push_current_local_ref(local_ref: *mut std::ffi::c_void) -> bool {
+pub(crate) unsafe fn push_current_local_ref(local_ref: *mut std::ffi::c_void) -> bool {
     if local_ref.is_null() {
         return false;
     }
@@ -154,6 +162,13 @@ unsafe fn push_current_local_ref(local_ref: *mut std::ffi::c_void) -> bool {
 fn jnew_diag_once(bit: u64, msg: &str) {
     let mask = 1u64 << bit;
     if JNEW_DIAG_BITS.fetch_or(mask, Ordering::AcqRel) & mask == 0 {
+        crate::jsapi::console::output_message(msg);
+    }
+}
+
+fn array_diag_once(bit: u64, msg: &str) {
+    let mask = 1u64 << (bit % 64);
+    if ARRAY_DIAG_BITS.fetch_or(mask, Ordering::AcqRel) & mask == 0 {
         crate::jsapi::console::output_message(msg);
     }
 }
@@ -212,6 +227,7 @@ pub(crate) unsafe fn register_lua_apis(state: &LuaState) {
     state.register_fn("shared_del", Some(lua_shared_del));
     state.register_fn("callback_count", Some(lua_callback_count));
     state.register_fn("callback_log_mark", Some(lua_callback_log_mark));
+    state.register_fn("callback_stats_line", Some(lua_callback_stats_line));
     if let Err(err) = state.dostring(LUA_FAST_HELPERS) {
         crate::jsapi::console::output_message(&format!("[lua] failed to install fast helpers: {}", err));
     }
@@ -934,6 +950,61 @@ unsafe extern "C" fn lua_callback_log_mark(L: *mut ffi::lua_State) -> std::os::r
     1
 }
 
+unsafe extern "C" fn lua_callback_stats_line(L: *mut ffi::lua_State) -> std::os::raw::c_int {
+    let (total, active, max_active, thread_states, orig_requests, native_enter, native_leave, native_fail) =
+        super::callback_stats();
+    let (
+        quick_callback_total_ns,
+        quick_callback_max_ns,
+        quick_main_callback_total,
+        quick_main_callback_total_ns,
+        quick_main_callback_max_ns,
+        trans_start_before_runnable,
+        trans_start_after_native,
+        trans_start_after_other,
+        trans_end_before_native,
+        trans_end_after_runnable,
+        trans_end_after_other,
+        trans_start_flags,
+        trans_end_flags,
+        trans_last_start_before,
+        trans_last_start_after,
+        trans_last_end_before,
+        trans_last_end_after,
+    ) = super::callback::quick_timing_snapshot();
+    let line = format!(
+        "total={} active={} maxActive={} threadStates={} orig={} native={}/{}/{} quickNs={} quickMaxNs={} mainCount={} mainNs={} mainMaxNs={} transStart={}/{}/{} transEnd={}/{}/{} flags={}/{} last=0x{:x}->0x{:x}/0x{:x}->0x{:x}",
+        total,
+        active,
+        max_active,
+        thread_states,
+        orig_requests,
+        native_enter,
+        native_leave,
+        native_fail,
+        quick_callback_total_ns,
+        quick_callback_max_ns,
+        quick_main_callback_total,
+        quick_main_callback_total_ns,
+        quick_main_callback_max_ns,
+        trans_start_before_runnable,
+        trans_start_after_native,
+        trans_start_after_other,
+        trans_end_before_native,
+        trans_end_after_runnable,
+        trans_end_after_other,
+        trans_start_flags,
+        trans_end_flags,
+        trans_last_start_before,
+        trans_last_start_after,
+        trans_last_end_before,
+        trans_last_end_after,
+    );
+    let cs = std::ffi::CString::new(line).unwrap_or_default();
+    ffi::lua_pushstring(L, cs.as_ptr());
+    1
+}
+
 unsafe fn local_ref_from_lua_obj(
     env: *const std::ffi::c_void,
     obj: u64,
@@ -1590,6 +1661,13 @@ unsafe fn lua_table_to_java_array_local(
     let abs_idx = ffi::lua_absindex(L, idx);
     let len = ffi::lua_rawlen(L, abs_idx) as usize;
     if len > LUA_AUTO_ARRAY_MAX_LEN {
+        array_diag_once(
+            0,
+            &format!(
+                "[lua array] table too large for auto Java array conversion: len={} sig={}",
+                len, type_sig
+            ),
+        );
         return std::ptr::null_mut();
     }
     let component_sig = &type_sig[1..];
@@ -1811,14 +1889,34 @@ unsafe fn lua_table_to_object_array_local(
     for i in 1..=len {
         ffi::lua_geti(L, table_idx, i as ffi::lua_Integer);
         let elem = lua_value_to_object_array_element(L, -1, component_sig, env);
+        let elem_was_nil = ffi::lua_isnil(L, -1);
+        let elem_type = ffi::lua_type(L, -1);
         ffi::lua_pop(L, 1);
         if elem.is_null() {
+            if !elem_was_nil {
+                array_diag_once(
+                    1,
+                    &format!(
+                        "[lua array] failed to convert table element #{} ({}) to {}",
+                        i,
+                        lua_typename_str(elem_type),
+                        component_sig
+                    ),
+                );
+            }
             continue;
         }
         set_object_array_element(env as *const std::ffi::c_void, array, (i - 1) as i32, elem);
         let had_exception = jni_exception_check_and_clear(env as *const std::ffi::c_void);
         delete_local_ref(env as *const std::ffi::c_void, elem);
         if had_exception {
+            array_diag_once(
+                2,
+                &format!(
+                    "[lua array] SetObjectArrayElement failed at #{} for component {}",
+                    i, component_sig
+                ),
+            );
             delete_local_ref(env as *const std::ffi::c_void, array);
             return std::ptr::null_mut();
         }
@@ -1845,9 +1943,244 @@ unsafe fn lua_value_to_object_array_element(
             .unwrap_or(std::ptr::null_mut())
         }
         ffi::LUA_TSTRING if component_sig.starts_with('L') => lua_string_to_jstring_local(L, idx, env),
-        ffi::LUA_TTABLE if component_sig.starts_with('[') => lua_table_to_java_array_local(L, idx, component_sig, env),
+        ffi::LUA_TTABLE => {
+            let (_, ref_kind) = get_current_ref_context();
+            if let Some(local) = lua_table_jptr(L, idx)
+                .and_then(|ptr| local_ref_from_lua_obj(env as *const std::ffi::c_void, ptr, ref_kind))
+                .map(|(local, _)| local)
+            {
+                local
+            } else if object_component_accepts_nested_array(component_sig) {
+                let nested_len = ffi::lua_rawlen(L, ffi::lua_absindex(L, idx)) as usize;
+                lua_table_to_object_array_local(L, ffi::lua_absindex(L, idx), "Ljava/lang/Object;", nested_len, env)
+            } else if component_sig.starts_with('[') {
+                lua_table_to_java_array_local(L, idx, component_sig, env)
+            } else {
+                std::ptr::null_mut()
+            }
+        }
+        ffi::LUA_TBOOLEAN | ffi::LUA_TNUMBER if component_sig.starts_with('L') => {
+            lua_scalar_to_boxed_object_local(L, idx, component_sig, env)
+        }
         _ => std::ptr::null_mut(),
     }
+}
+
+fn object_component_accepts_nested_array(component_sig: &str) -> bool {
+    matches!(
+        component_sig,
+        "Ljava/lang/Object;" | "Ljava/io/Serializable;" | "Ljava/lang/Cloneable;"
+    )
+}
+
+unsafe fn lua_table_jptr(L: *mut ffi::lua_State, idx: i32) -> Option<u64> {
+    if ffi::lua_type(L, idx) != ffi::LUA_TTABLE as i32 {
+        return None;
+    }
+    let abs_idx = ffi::lua_absindex(L, idx);
+    ffi::lua_getfield(L, abs_idx, c"__jptr".as_ptr());
+    let ptr = match ffi::lua_type(L, -1) as u32 {
+        ffi::LUA_TLIGHTUSERDATA => ffi::lua_touserdata(L, -1) as u64,
+        ffi::LUA_TNUMBER => ffi::lua_tointeger_ex(L, -1) as u64,
+        _ => 0,
+    };
+    ffi::lua_pop(L, 1);
+    (ptr != 0).then_some(ptr)
+}
+
+#[derive(Clone, Copy)]
+enum BoxedArgKind {
+    Boolean,
+    Byte,
+    Character,
+    Short,
+    Integer,
+    Long,
+    Float,
+    Double,
+}
+
+impl BoxedArgKind {
+    fn class_name(self) -> &'static str {
+        match self {
+            Self::Boolean => "java/lang/Boolean",
+            Self::Byte => "java/lang/Byte",
+            Self::Character => "java/lang/Character",
+            Self::Short => "java/lang/Short",
+            Self::Integer => "java/lang/Integer",
+            Self::Long => "java/lang/Long",
+            Self::Float => "java/lang/Float",
+            Self::Double => "java/lang/Double",
+        }
+    }
+
+    fn value_of_sig(self) -> &'static str {
+        match self {
+            Self::Boolean => "(Z)Ljava/lang/Boolean;",
+            Self::Byte => "(B)Ljava/lang/Byte;",
+            Self::Character => "(C)Ljava/lang/Character;",
+            Self::Short => "(S)Ljava/lang/Short;",
+            Self::Integer => "(I)Ljava/lang/Integer;",
+            Self::Long => "(J)Ljava/lang/Long;",
+            Self::Float => "(F)Ljava/lang/Float;",
+            Self::Double => "(D)Ljava/lang/Double;",
+        }
+    }
+
+    unsafe fn arg(self, L: *mut ffi::lua_State, idx: i32) -> u64 {
+        match self {
+            Self::Boolean => lua_to_bool(L, idx) as u64,
+            Self::Byte => lua_to_integer(L, idx) as i8 as u64,
+            Self::Character => lua_to_char(L, idx) as u64,
+            Self::Short => lua_to_integer(L, idx) as i16 as u64,
+            Self::Integer => lua_to_integer(L, idx) as i32 as u64,
+            Self::Long => lua_to_integer(L, idx) as u64,
+            Self::Float => (lua_to_number(L, idx) as f32).to_bits() as u64,
+            Self::Double => lua_to_number(L, idx).to_bits(),
+        }
+    }
+}
+
+unsafe fn lua_scalar_to_boxed_object_local(
+    L: *mut ffi::lua_State,
+    idx: i32,
+    component_sig: &str,
+    env: crate::jsapi::java::jni_core::JniEnv,
+) -> *mut std::ffi::c_void {
+    let Some(kind) = boxed_kind_for_lua_value(L, idx, component_sig) else {
+        return std::ptr::null_mut();
+    };
+    call_boxed_value_of(env, kind, kind.arg(L, idx))
+}
+
+unsafe fn boxed_kind_for_lua_value(L: *mut ffi::lua_State, idx: i32, component_sig: &str) -> Option<BoxedArgKind> {
+    let tp = ffi::lua_type(L, idx) as u32;
+    match component_sig {
+        "Ljava/lang/Boolean;" => Some(BoxedArgKind::Boolean),
+        "Ljava/lang/Byte;" => Some(BoxedArgKind::Byte),
+        "Ljava/lang/Character;" => Some(BoxedArgKind::Character),
+        "Ljava/lang/Short;" => Some(BoxedArgKind::Short),
+        "Ljava/lang/Integer;" => Some(BoxedArgKind::Integer),
+        "Ljava/lang/Long;" => Some(BoxedArgKind::Long),
+        "Ljava/lang/Float;" => Some(BoxedArgKind::Float),
+        "Ljava/lang/Double;" => Some(BoxedArgKind::Double),
+        "Ljava/lang/Number;" => {
+            if tp == ffi::LUA_TNUMBER && ffi::lua_isinteger(L, idx) != 0 {
+                Some(BoxedArgKind::Long)
+            } else if tp == ffi::LUA_TNUMBER {
+                Some(BoxedArgKind::Double)
+            } else {
+                None
+            }
+        }
+        "Ljava/lang/Object;" | "Ljava/io/Serializable;" | "Ljava/lang/Comparable;" => match tp {
+            ffi::LUA_TBOOLEAN => Some(BoxedArgKind::Boolean),
+            ffi::LUA_TNUMBER if ffi::lua_isinteger(L, idx) != 0 => Some(BoxedArgKind::Long),
+            ffi::LUA_TNUMBER => Some(BoxedArgKind::Double),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+unsafe fn call_boxed_value_of(
+    env: crate::jsapi::java::jni_core::JniEnv,
+    kind: BoxedArgKind,
+    arg: u64,
+) -> *mut std::ffi::c_void {
+    if env.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(cache) = get_boxed_value_of_cache(env, kind) else {
+        return std::ptr::null_mut();
+    };
+    let vtable = *(env as *const *const usize);
+    type CallStaticObjectMethodAFn = unsafe extern "C" fn(
+        *const std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *const std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    let call_static_obj: CallStaticObjectMethodAFn = std::mem::transmute(*vtable.add(116));
+    let args = [arg];
+    let obj = call_static_obj(
+        env as *const std::ffi::c_void,
+        cache.class_global as *mut std::ffi::c_void,
+        cache.method_id as *mut std::ffi::c_void,
+        args.as_ptr() as *const std::ffi::c_void,
+    );
+    if obj.is_null() || jni_exception_check_and_clear(env as *const std::ffi::c_void) {
+        array_diag_once(3, &format!("[lua array] boxed {}.valueOf failed", kind.class_name()));
+        std::ptr::null_mut()
+    } else {
+        obj
+    }
+}
+
+unsafe fn get_boxed_value_of_cache(
+    env: crate::jsapi::java::jni_core::JniEnv,
+    kind: BoxedArgKind,
+) -> Option<BoxedValueOfCache> {
+    let class_name = kind.class_name();
+    let cache = BOXED_VALUE_OF_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(v) = cache.read().unwrap_or_else(|e| e.into_inner()).get(class_name).copied() {
+        return Some(v);
+    }
+
+    let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = guard.get(class_name).copied() {
+        return Some(v);
+    }
+
+    let vtable = *(env as *const *const usize);
+    type FindClassFn =
+        unsafe extern "C" fn(*const std::ffi::c_void, *const std::os::raw::c_char) -> *mut std::ffi::c_void;
+    type NewGlobalRefFn = unsafe extern "C" fn(*const std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    type GetStaticMethodIdFn = unsafe extern "C" fn(
+        *const std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *const std::os::raw::c_char,
+        *const std::os::raw::c_char,
+    ) -> *mut std::ffi::c_void;
+
+    let find_class: FindClassFn = std::mem::transmute(*vtable.add(6));
+    let new_global_ref: NewGlobalRefFn = std::mem::transmute(*vtable.add(21));
+    let get_static_method_id: GetStaticMethodIdFn = std::mem::transmute(*vtable.add(113));
+    let Ok(class_cs) = std::ffi::CString::new(class_name) else {
+        return None;
+    };
+    let cls = find_class(env as *const std::ffi::c_void, class_cs.as_ptr());
+    if cls.is_null() || jni_exception_check_and_clear(env as *const std::ffi::c_void) {
+        array_diag_once(4, &format!("[lua array] boxed class not found: {}", class_name));
+        return None;
+    }
+    let Ok(sig_cs) = std::ffi::CString::new(kind.value_of_sig()) else {
+        delete_local_ref(env as *const std::ffi::c_void, cls);
+        return None;
+    };
+    let mid = get_static_method_id(
+        env as *const std::ffi::c_void,
+        cls,
+        c"valueOf".as_ptr(),
+        sig_cs.as_ptr(),
+    );
+    if mid.is_null() || jni_exception_check_and_clear(env as *const std::ffi::c_void) {
+        delete_local_ref(env as *const std::ffi::c_void, cls);
+        array_diag_once(5, &format!("[lua array] boxed valueOf not found: {}", class_name));
+        return None;
+    }
+    let global = new_global_ref(env as *const std::ffi::c_void, cls);
+    delete_local_ref(env as *const std::ffi::c_void, cls);
+    if global.is_null() || jni_exception_check_and_clear(env as *const std::ffi::c_void) {
+        array_diag_once(6, &format!("[lua array] boxed NewGlobalRef failed: {}", class_name));
+        return None;
+    }
+    let entry = BoxedValueOfCache {
+        class_global: global as usize,
+        method_id: mid as usize,
+    };
+    guard.insert(class_name, entry);
+    Some(entry)
 }
 
 unsafe fn find_array_component_class(

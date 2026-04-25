@@ -139,7 +139,7 @@ static CLASS_OBJECT_SIZE_OFFSET: OnceLock<usize> = OnceLock::new();
 /// 典型函数体只有 ~16 条指令，且必定含 `add xD, xN, #offset` 后紧跟 `ldar/stlr`。
 /// 我们扫前 40 条指令，取第一个 imm12 ∈ [0x20, 0xC0] 的 64-bit ADD immediate。
 /// 探测失败 fallback 到 `CLASS_OBJECT_SIZE_OFFSET_CANDIDATES[0]`（最现代版本的值）。
-fn resolve_class_object_size_offset() -> usize {
+pub(crate) fn resolve_class_object_size_offset() -> usize {
     *CLASS_OBJECT_SIZE_OFFSET.get_or_init(|| unsafe {
         let fn_addr = crate::jsapi::module::libart_dlsym("_ZN3art6mirror5Class26SetObjectSizeAllocFastPathEj") as u64;
         let fallback = CLASS_OBJECT_SIZE_OFFSET_CANDIDATES[0];

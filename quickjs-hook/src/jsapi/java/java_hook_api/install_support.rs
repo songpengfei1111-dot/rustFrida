@@ -185,7 +185,7 @@ pub(super) unsafe fn create_quick_stack_sentinel_art_method(
     data_off: usize,
     ep_offset: usize,
     stack_entry_point: u64,
-) -> Result<usize, String> {
+) -> Result<(usize, u64), String> {
     const K_ACC_STATIC: u32 = 0x0008;
 
     let sentinel_src =
@@ -242,7 +242,7 @@ pub(super) unsafe fn create_quick_stack_sentinel_art_method(
         data_off, ep_offset, repl_data, repl_ep
     ));
 
-    Ok(repl)
+    Ok((repl, sentinel_src))
 }
 
 pub(super) unsafe fn update_original_method_flags_for_hook(

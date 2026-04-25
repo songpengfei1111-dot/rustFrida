@@ -112,9 +112,11 @@ pub(crate) unsafe fn install_lua_hook_inner(
             stack_entry_point,
             per_method_hook_target.unwrap_or(0)
         ));
-        let replacement_addr =
+        let (replacement_addr, sentinel_source) =
             create_quick_stack_sentinel_art_method(env, clone_size, spec, data_off, ep_offset, stack_entry_point)?;
         install_guard.set_replacement_addr(replacement_addr);
+
+        ensure_art_controller_initialized(&bridge, ep_offset, env as *mut std::ffi::c_void);
 
         if quick_orig_precall {
             set_quick_callback_method_mode(
@@ -163,6 +165,7 @@ pub(crate) unsafe fn install_lua_hook_inner(
                     hook_type: HookType::Quick {
                         replacement_addr,
                         per_method_hook_target,
+                        declaring_class_source: sentinel_source,
                     },
                     clone_addr: 0,
                     class_global_ref,

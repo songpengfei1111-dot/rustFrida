@@ -454,7 +454,12 @@ void hook_art_router_get_route_stats(uint64_t* quick_hits,
                                      uint64_t* last_do_call_x0,
                                      uint64_t* quick_pass_hits,
                                      uint64_t* quick_callback_calls,
-                                     uint64_t* quick_skip_hits);
+                                     uint64_t* quick_skip_hits,
+                                     uint64_t* quick_callee_save_frames,
+                                     uint64_t* quick_callee_save_method,
+                                     uint64_t* quick_top_quick_frame_offset,
+                                     uint64_t* quick_test_suspend_calls,
+                                     uint64_t* quick_test_suspend_entrypoint);
 
 /*
  * Debug: reset the not_found X0 capture and miss counter.

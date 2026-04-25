@@ -20,6 +20,7 @@ pub(super) enum HookType {
     Quick {
         replacement_addr: usize,
         per_method_hook_target: Option<u64>,
+        declaring_class_source: u64,
     },
 }
 

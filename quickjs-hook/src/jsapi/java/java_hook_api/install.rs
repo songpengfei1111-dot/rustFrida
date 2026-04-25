@@ -455,6 +455,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook_quick(
                 hook_type: HookType::Quick {
                     replacement_addr,
                     per_method_hook_target,
+                    declaring_class_source: art_method,
                 },
                 clone_addr: 0,
                 class_global_ref,
