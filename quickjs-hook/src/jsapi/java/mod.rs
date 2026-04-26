@@ -618,6 +618,21 @@ unsafe extern "C" fn js_art_route_stats(
     );
     obj_val.set_property(
         ctx,
+        "oatInlinePatchCount",
+        JSValue(ffi::JS_NewBigUint64(ctx, hook_ffi::hook_oat_inline_patch_count())),
+    );
+    obj_val.set_property(
+        ctx,
+        "oatPcPoolBypassHits",
+        JSValue(ffi::JS_NewBigUint64(ctx, hook_ffi::hook_oat_pc_pool_bypass_hits())),
+    );
+    obj_val.set_property(
+        ctx,
+        "oatReplacementBypassHits",
+        JSValue(ffi::JS_NewBigUint64(ctx, hook_ffi::hook_oat_replacement_bypass_hits())),
+    );
+    obj_val.set_property(
+        ctx,
         "getOatHookPoolOriginal",
         JSValue(ffi::JS_NewBigUint64(
             ctx,

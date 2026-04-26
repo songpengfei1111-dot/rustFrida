@@ -68,6 +68,32 @@ typedef struct {
 
 static OatInlinePatchEntry g_oat_patches[MAX_OAT_INLINE_PATCHES];
 static int g_oat_patch_count = 0;
+static uint64_t g_oat_pc_pool_bypass_count = 0;
+static uint64_t g_oat_replacement_bypass_count = 0;
+
+uint64_t hook_oat_inline_patch_count(void) {
+    return (uint64_t)__atomic_load_n(&g_oat_patch_count, __ATOMIC_RELAXED);
+}
+
+uint64_t hook_oat_pc_pool_bypass_hits(void) {
+    return __atomic_load_n(&g_oat_pc_pool_bypass_count, __ATOMIC_RELAXED);
+}
+
+uint64_t hook_oat_replacement_bypass_hits(void) {
+    return __atomic_load_n(&g_oat_replacement_bypass_count, __ATOMIC_RELAXED);
+}
+
+void hook_oat_patch_reset_stats(void) {
+    __atomic_store_n(&g_oat_pc_pool_bypass_count, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_oat_replacement_bypass_count, 0, __ATOMIC_RELAXED);
+}
+
+uint64_t hook_oat_pc_pool_bypass_check(uint64_t pc) {
+    if (!hook_is_in_exec_pool(pc))
+        return 0;
+    __atomic_fetch_add(&g_oat_pc_pool_bypass_count, 1, __ATOMIC_RELAXED);
+    return 1;
+}
 
 /* ============================================================================
  * is_replacement_in_table — check g_art_router_table for replacement match
@@ -79,8 +105,10 @@ static uint64_t is_replacement_in_table(uint64_t method) {
     for (int i = 0; i < ART_ROUTER_TABLE_MAX; i++) {
         if (g_art_router_table[i].original == 0)
             break;
-        if (g_art_router_table[i].replacement == method)
+        if (g_art_router_table[i].replacement == method) {
+            __atomic_fetch_add(&g_oat_replacement_bypass_count, 1, __ATOMIC_RELAXED);
             return 1;
+        }
     }
     return 0;
 }
@@ -485,7 +513,7 @@ static void* generate_oat_inline_thunk(
     /* --- Step 4: If the frame PC is in our hook pool, force runtime/native path. --- */
     arm64_writer_put_mov_reg_reg(&w, ARM64_REG_X0,
         (Arm64Reg)(ARM64_REG_X0 + match->pc_reg));
-    arm64_writer_put_call_address(&w, (uint64_t)hook_is_in_exec_pool);
+    arm64_writer_put_call_address(&w, (uint64_t)hook_oat_pc_pool_bypass_check);
     arm64_writer_put_cbnz_reg_label(&w, ARM64_REG_X0, lbl_restore_runtime);
 
     /* --- Step 5: Call is_replacement_in_table(method) --- */

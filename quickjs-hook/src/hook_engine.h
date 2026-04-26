@@ -479,6 +479,11 @@ uint64_t hook_orig_bypass_hits(void);
 uint64_t hook_orig_bypass_set_successes(void);
 uint64_t hook_orig_bypass_set_failures(void);
 uint64_t hook_orig_bypass_active_count(void);
+uint64_t hook_oat_inline_patch_count(void);
+uint64_t hook_oat_pc_pool_bypass_hits(void);
+uint64_t hook_oat_replacement_bypass_hits(void);
+void hook_oat_patch_reset_stats(void);
+uint64_t hook_oat_pc_pool_bypass_check(uint64_t pc);
 
 /*
  * Install an ART method router hook with inline table lookup.

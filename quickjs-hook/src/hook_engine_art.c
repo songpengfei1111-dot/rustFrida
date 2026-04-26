@@ -237,6 +237,7 @@ void hook_art_router_reset_debug(void) {
     __atomic_store_n(&g_orig_bypass_hit, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_orig_bypass_set_success, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_orig_bypass_set_fail, 0, __ATOMIC_RELAXED);
+    hook_oat_patch_reset_stats();
 }
 
 uint64_t* hook_managed_backup_stub_hit_counter_addr(void) {
