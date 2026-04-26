@@ -521,6 +521,21 @@ void* hook_install_managed_direct_router(void* target,
                                          uint64_t original_method);
 
 /*
+ * Create a JNI native body for managed DSL orig().
+ *
+ * The generated Java helper calls this native method immediately before
+ * invoking the original Java method. The body arms the per-thread quick
+ * bypass and returns to managed code; the following Java invoke consumes the
+ * bypass in hook_art_router_fast_bypass().
+ */
+void* hook_create_managed_orig_bypass_native(uint64_t original_method,
+                                             uint64_t trampoline_target,
+                                             void** out_state);
+void hook_update_managed_orig_bypass_native(void* state,
+                                            uint64_t original_method,
+                                            uint64_t trampoline_target);
+
+/*
  * Return the generated ART router thunk body for a hooked quickCode target.
  * The returned address is entry_point compatible (fake OAT header lives
  * immediately before it). Returns NULL if target is not currently hooked.

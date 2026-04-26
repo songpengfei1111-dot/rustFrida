@@ -6,8 +6,12 @@ pub(super) const ACC_PROTECTED: u32 = 0x0004;
 pub(super) const ACC_STATIC: u32 = 0x0008;
 pub(super) const ACC_FINAL: u32 = 0x0010;
 pub(super) const ACC_VOLATILE: u32 = 0x0040;
+pub(super) const ACC_NATIVE: u32 = 0x0100;
 pub(super) const ACC_CONSTRUCTOR: u32 = 0x0001_0000;
 pub(super) const ACC_DECLARED_SYNCHRONIZED: u32 = 0x0002_0000;
+
+pub(super) const MANAGED_ORIG_NATIVE_NAME: &str = "__rf_arm_orig";
+pub(super) const MANAGED_ORIG_NATIVE_SIG: &str = "()V";
 
 const TYPE_HEADER_ITEM: u16 = 0x0000;
 const TYPE_STRING_ID_ITEM: u16 = 0x0001;
@@ -54,11 +58,7 @@ pub(super) struct FieldRef {
 }
 
 impl FieldRef {
-    pub(super) fn new(
-        class_type: impl Into<String>,
-        type_name: impl Into<String>,
-        name: impl Into<String>,
-    ) -> Self {
+    pub(super) fn new(class_type: impl Into<String>, type_name: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             class_type: class_type.into(),
             type_name: type_name.into(),
@@ -308,21 +308,11 @@ impl DexIrBuilder {
     }
 
     pub(super) fn iget(&mut self, dst: u8, obj: u8, field: FieldRef, kind: ValueKind) {
-        self.instrs.push(IrInstr::Iget {
-            dst,
-            obj,
-            field,
-            kind,
-        });
+        self.instrs.push(IrInstr::Iget { dst, obj, field, kind });
     }
 
     pub(super) fn iput(&mut self, src: u8, obj: u8, field: FieldRef, kind: ValueKind) {
-        self.instrs.push(IrInstr::Iput {
-            src,
-            obj,
-            field,
-            kind,
-        });
+        self.instrs.push(IrInstr::Iput { src, obj, field, kind });
     }
 
     pub(super) fn sget(&mut self, dst: u8, field: FieldRef, kind: ValueKind) {
@@ -392,46 +382,159 @@ impl DexIrBuilder {
 }
 
 enum IrInstr {
-    Const4 { dst: u8, literal: i8 },
-    Const16 { dst: u8, literal: i16 },
-    ConstString { dst: u8, value: String },
-    MoveFrom16 { dst: u8, src: u16, kind: ValueKind },
+    Const4 {
+        dst: u8,
+        literal: i8,
+    },
+    Const16 {
+        dst: u8,
+        literal: i16,
+    },
+    ConstString {
+        dst: u8,
+        value: String,
+    },
+    MoveFrom16 {
+        dst: u8,
+        src: u16,
+        kind: ValueKind,
+    },
     IfCmp {
         op: IfCmpOp,
         left: u8,
         right: u8,
         target: DexLabel,
     },
-    IfEqz { reg: u8, target: DexLabel },
-    IfNez { reg: u8, target: DexLabel },
-    Goto16 { target: DexLabel },
-    NewInstance { dst: u8, ty: String },
-    CheckCast { reg: u8, ty: String },
-    InstanceOf { dst: u8, obj: u8, ty: String },
-    ArrayLength { dst: u8, array: u8 },
-    NewArray { dst: u8, size: u8, ty: String },
-    Aget { dst: u8, array: u8, index: u8, kind: ValueKind },
-    Aput { src: u8, array: u8, index: u8, kind: ValueKind },
-    InvokeDirect { args: Vec<u8>, method: MethodRef },
-    InvokeVirtual { args: Vec<u8>, method: MethodRef },
-    InvokeStatic { args: Vec<u8>, method: MethodRef },
-    InvokeInterface { args: Vec<u8>, method: MethodRef },
-    InvokeDirectRange { first_reg: u16, arg_words: u8, method: MethodRef },
-    InvokeStaticRange { first_reg: u16, arg_words: u8, method: MethodRef },
-    InvokeVirtualRange { first_reg: u16, arg_words: u8, method: MethodRef },
-    InvokeInterfaceRange { first_reg: u16, arg_words: u8, method: MethodRef },
-    SputObject { src: u8, field: FieldRef },
-    Iget { dst: u8, obj: u8, field: FieldRef, kind: ValueKind },
-    Iput { src: u8, obj: u8, field: FieldRef, kind: ValueKind },
-    Sget { dst: u8, field: FieldRef, kind: ValueKind },
-    Sput { src: u8, field: FieldRef, kind: ValueKind },
-    AddIntLit8 { dst: u8, src: u8, literal: i8 },
-    MoveResult { dst: u8 },
-    MoveResultWide { dst: u8 },
-    MoveResultObject { dst: u8 },
-    Return { src: u8 },
-    ReturnWide { src: u8 },
-    ReturnObject { src: u8 },
+    IfEqz {
+        reg: u8,
+        target: DexLabel,
+    },
+    IfNez {
+        reg: u8,
+        target: DexLabel,
+    },
+    Goto16 {
+        target: DexLabel,
+    },
+    NewInstance {
+        dst: u8,
+        ty: String,
+    },
+    CheckCast {
+        reg: u8,
+        ty: String,
+    },
+    InstanceOf {
+        dst: u8,
+        obj: u8,
+        ty: String,
+    },
+    ArrayLength {
+        dst: u8,
+        array: u8,
+    },
+    NewArray {
+        dst: u8,
+        size: u8,
+        ty: String,
+    },
+    Aget {
+        dst: u8,
+        array: u8,
+        index: u8,
+        kind: ValueKind,
+    },
+    Aput {
+        src: u8,
+        array: u8,
+        index: u8,
+        kind: ValueKind,
+    },
+    InvokeDirect {
+        args: Vec<u8>,
+        method: MethodRef,
+    },
+    InvokeVirtual {
+        args: Vec<u8>,
+        method: MethodRef,
+    },
+    InvokeStatic {
+        args: Vec<u8>,
+        method: MethodRef,
+    },
+    InvokeInterface {
+        args: Vec<u8>,
+        method: MethodRef,
+    },
+    InvokeDirectRange {
+        first_reg: u16,
+        arg_words: u8,
+        method: MethodRef,
+    },
+    InvokeStaticRange {
+        first_reg: u16,
+        arg_words: u8,
+        method: MethodRef,
+    },
+    InvokeVirtualRange {
+        first_reg: u16,
+        arg_words: u8,
+        method: MethodRef,
+    },
+    InvokeInterfaceRange {
+        first_reg: u16,
+        arg_words: u8,
+        method: MethodRef,
+    },
+    SputObject {
+        src: u8,
+        field: FieldRef,
+    },
+    Iget {
+        dst: u8,
+        obj: u8,
+        field: FieldRef,
+        kind: ValueKind,
+    },
+    Iput {
+        src: u8,
+        obj: u8,
+        field: FieldRef,
+        kind: ValueKind,
+    },
+    Sget {
+        dst: u8,
+        field: FieldRef,
+        kind: ValueKind,
+    },
+    Sput {
+        src: u8,
+        field: FieldRef,
+        kind: ValueKind,
+    },
+    AddIntLit8 {
+        dst: u8,
+        src: u8,
+        literal: i8,
+    },
+    MoveResult {
+        dst: u8,
+    },
+    MoveResultWide {
+        dst: u8,
+    },
+    MoveResultObject {
+        dst: u8,
+    },
+    Return {
+        src: u8,
+    },
+    ReturnWide {
+        src: u8,
+    },
+    ReturnObject {
+        src: u8,
+    },
     ReturnVoid,
 }
 
@@ -515,12 +618,7 @@ impl IrInstr {
         }
     }
 
-    fn emit(
-        self,
-        code: &mut DexCode,
-        offset: usize,
-        labels: &[Option<usize>],
-    ) -> Result<(), String> {
+    fn emit(self, code: &mut DexCode, offset: usize, labels: &[Option<usize>]) -> Result<(), String> {
         match self {
             IrInstr::Const4 { dst, literal } => {
                 require_nibble(dst, "const/4 dst")?;
@@ -544,7 +642,9 @@ impl IrInstr {
                 let opcode = match kind {
                     ValueKind::Wide => 0x0005,
                     ValueKind::Object => 0x0008,
-                    ValueKind::Narrow | ValueKind::Boolean | ValueKind::Byte | ValueKind::Char | ValueKind::Short => 0x0002,
+                    ValueKind::Narrow | ValueKind::Boolean | ValueKind::Byte | ValueKind::Char | ValueKind::Short => {
+                        0x0002
+                    }
                 };
                 code.raw(opcode | ((dst as u16) << 8));
                 code.raw(src);
@@ -856,7 +956,10 @@ fn branch_offset(
 
 fn require_nibble(value: u8, what: &str) -> Result<(), String> {
     if value > 0x0f {
-        return Err(format!("{} register out of range for nibble encoding: v{}", what, value));
+        return Err(format!(
+            "{} register out of range for nibble encoding: v{}",
+            what, value
+        ));
     }
     Ok(())
 }
@@ -938,11 +1041,37 @@ impl DexClass {
         access_flags: u32,
         code: DexCode,
     ) -> MethodRef {
-        let method = MethodRef::new(self.class_type.clone(), name.to_string(), return_type.to_string(), params);
+        let method = MethodRef::new(
+            self.class_type.clone(),
+            name.to_string(),
+            return_type.to_string(),
+            params,
+        );
         self.direct_methods.push(ClassMethod {
             method: method.clone(),
             access_flags,
             code: Some(code),
+        });
+        method
+    }
+
+    pub(super) fn native_direct_method(
+        &mut self,
+        name: &str,
+        return_type: &str,
+        params: Vec<String>,
+        access_flags: u32,
+    ) -> MethodRef {
+        let method = MethodRef::new(
+            self.class_type.clone(),
+            name.to_string(),
+            return_type.to_string(),
+            params,
+        );
+        self.direct_methods.push(ClassMethod {
+            method: method.clone(),
+            access_flags,
+            code: None,
         });
         method
     }
@@ -1052,19 +1181,12 @@ impl DexBuilder {
         }
 
         let strings: Vec<String> = string_set.into_iter().collect();
-        let string_idx: BTreeMap<String, u32> = strings
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.clone(), i as u32))
-            .collect();
+        let string_idx: BTreeMap<String, u32> =
+            strings.iter().enumerate().map(|(i, s)| (s.clone(), i as u32)).collect();
 
         let mut types: Vec<String> = type_set.into_iter().collect();
         types.sort_by_key(|ty| string_idx[ty]);
-        let type_idx: BTreeMap<String, u32> = types
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.clone(), i as u32))
-            .collect();
+        let type_idx: BTreeMap<String, u32> = types.iter().enumerate().map(|(i, s)| (s.clone(), i as u32)).collect();
 
         let mut protos: Vec<ProtoSpec> = proto_set.into_iter().collect();
         protos.sort_by_key(|p| {
@@ -1074,39 +1196,18 @@ impl DexBuilder {
                 string_idx[&p.shorty()],
             )
         });
-        let proto_idx: BTreeMap<ProtoSpec, u32> = protos
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (p.clone(), i as u32))
-            .collect();
+        let proto_idx: BTreeMap<ProtoSpec, u32> =
+            protos.iter().enumerate().map(|(i, p)| (p.clone(), i as u32)).collect();
 
         let mut fields: Vec<FieldRef> = self.field_refs.into_iter().collect();
-        fields.sort_by_key(|f| {
-            (
-                type_idx[&f.class_type],
-                string_idx[&f.name],
-                type_idx[&f.type_name],
-            )
-        });
-        let field_idx: BTreeMap<FieldRef, u32> = fields
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (f.clone(), i as u32))
-            .collect();
+        fields.sort_by_key(|f| (type_idx[&f.class_type], string_idx[&f.name], type_idx[&f.type_name]));
+        let field_idx: BTreeMap<FieldRef, u32> =
+            fields.iter().enumerate().map(|(i, f)| (f.clone(), i as u32)).collect();
 
         let mut methods: Vec<MethodRef> = self.method_refs.into_iter().collect();
-        methods.sort_by_key(|m| {
-            (
-                type_idx[&m.class_type],
-                string_idx[&m.name],
-                proto_idx[&m.proto],
-            )
-        });
-        let method_idx: BTreeMap<MethodRef, u32> = methods
-            .iter()
-            .enumerate()
-            .map(|(i, m)| (m.clone(), i as u32))
-            .collect();
+        methods.sort_by_key(|m| (type_idx[&m.class_type], string_idx[&m.name], proto_idx[&m.proto]));
+        let method_idx: BTreeMap<MethodRef, u32> =
+            methods.iter().enumerate().map(|(i, m)| (m.clone(), i as u32)).collect();
 
         let mut type_lists = BTreeSet::<Vec<u32>>::new();
         for proto in &protos {
@@ -1126,11 +1227,7 @@ impl DexBuilder {
 
         let mut data = Vec::new();
         let mut type_list_offsets = BTreeMap::<Vec<u32>, u32>::new();
-        let first_type_list_off = if type_lists.is_empty() {
-            0
-        } else {
-            data_off as u32
-        };
+        let first_type_list_off = if type_lists.is_empty() { 0 } else { data_off as u32 };
         for key in &type_lists {
             align_vec4(&mut data);
             let off = (data_off + data.len()) as u32;
@@ -1159,13 +1256,7 @@ impl DexBuilder {
             align_vec4(&mut data);
             let class_data_off = (data_off + data.len()) as u32;
             class_data_offsets.push(class_data_off);
-            write_class_data_item(
-                &mut data,
-                class,
-                &field_idx,
-                &method_idx,
-                &mut code_patch_offsets,
-            )?;
+            write_class_data_item(&mut data, class, &field_idx, &method_idx, &mut code_patch_offsets)?;
         }
 
         let mut code_offsets = Vec::<u32>::new();
@@ -1192,7 +1283,11 @@ impl DexBuilder {
                 (TYPE_MAP_LIST, 1, map_off),
                 (TYPE_TYPE_LIST, type_lists.len() as u32, first_type_list_off),
                 (TYPE_CLASS_DATA_ITEM, self.classes.len() as u32, class_data_offsets[0]),
-                (TYPE_CODE_ITEM, code_offsets.len() as u32, code_offsets.first().copied().unwrap_or(0)),
+                (
+                    TYPE_CODE_ITEM,
+                    code_offsets.len() as u32,
+                    code_offsets.first().copied().unwrap_or(0),
+                ),
                 (TYPE_STRING_DATA_ITEM, strings.len() as u32, first_string_data_off),
             ],
         );
@@ -1258,11 +1353,7 @@ impl DexBuilder {
             write_u32_at(&mut out, off + 4, class.access_flags);
             write_u32_at(&mut out, off + 8, type_idx[&class.super_type]);
             write_u32_at(&mut out, off + 12, 0);
-            let source_idx = class
-                .source_file
-                .as_ref()
-                .map(|s| string_idx[s])
-                .unwrap_or(0xffff_ffff);
+            let source_idx = class.source_file.as_ref().map(|s| string_idx[s]).unwrap_or(0xffff_ffff);
             write_u32_at(&mut out, off + 16, source_idx);
             write_u32_at(&mut out, off + 20, 0);
             write_u32_at(&mut out, off + 24, class_data_offsets[i]);
@@ -1283,6 +1374,7 @@ pub(super) struct GeneratedManagedDex {
     pub class_name: String,
     pub method_name: String,
     pub method_sig: String,
+    pub orig_native: bool,
     pub string_literals: Vec<GeneratedStringLiteral>,
 }
 
@@ -1525,7 +1617,11 @@ impl DslBuildContext {
             field_name: field_name.clone(),
             value: value.to_string(),
         });
-        FieldRef::new(self.generated_type.clone(), "Ljava/lang/String;".to_string(), field_name)
+        FieldRef::new(
+            self.generated_type.clone(),
+            "Ljava/lang/String;".to_string(),
+            field_name,
+        )
     }
 }
 
@@ -1675,7 +1771,10 @@ fn emit_call_value(
     let class_type = java_class_to_descriptor(&stmt.class_name)?;
     let (params, return_type) = parse_method_signature(&stmt.sig)?;
     if return_type == "V" {
-        return Err(format!("{}.{}{} returns void and cannot be used as a value", stmt.class_name, stmt.method_name, stmt.sig));
+        return Err(format!(
+            "{}.{}{} returns void and cannot be used as a value",
+            stmt.class_name, stmt.method_name, stmt.sig
+        ));
     }
     if !value_descriptor_assignable_to(&return_type, expected_type) {
         return Err(format!(
@@ -1709,16 +1808,7 @@ fn emit_call_value(
         DslCallKind::Interface => ManagedInvokeKind::Interface,
         DslCallKind::Static => ManagedInvokeKind::Static,
     };
-    emit_invoke_with_values(
-        ir,
-        invoke_kind,
-        method,
-        receiver,
-        &params,
-        &stmt.args,
-        layout,
-        dsl_ctx,
-    )?;
+    emit_invoke_with_values(ir, invoke_kind, method, receiver, &params, &stmt.args, layout, dsl_ctx)?;
     emit_move_result_value(ir, &return_type, dst)
 }
 
@@ -2029,13 +2119,17 @@ fn infer_cmp_descriptor(value: &DslValue, layout: &HelperParamLayout) -> Option<
     match value {
         DslValue::Int(_) | DslValue::AddLit(_, _) | DslValue::SubLit(_, _) => Some("I"),
         DslValue::Target(DslTarget::Result) => Some("I"),
-        DslValue::Target(DslTarget::Local(name)) => layout
-            .local_regs
-            .get(name)
-            .and_then(|slot| if slot.descriptor == "I" { Some("I") } else { None }),
-        DslValue::Call(stmt) => parse_method_signature(&stmt.sig)
-            .ok()
-            .and_then(|(_, ret)| if ret == "I" { Some("I") } else { None }),
+        DslValue::Target(DslTarget::Local(name)) => {
+            layout
+                .local_regs
+                .get(name)
+                .and_then(|slot| if slot.descriptor == "I" { Some("I") } else { None })
+        }
+        DslValue::Call(stmt) => {
+            parse_method_signature(&stmt.sig)
+                .ok()
+                .and_then(|(_, ret)| if ret == "I" { Some("I") } else { None })
+        }
         DslValue::FieldGet { stmt, .. } => java_class_to_descriptor_or_primitive(&stmt.type_name)
             .ok()
             .and_then(|desc| if desc == "I" { Some("I") } else { None }),
@@ -2080,22 +2174,8 @@ fn emit_if_cmp(
     } else {
         "Ljava/lang/Object;"
     };
-    let left_reg = emit_load_cmp_value(
-        ir,
-        left,
-        expected_type,
-        REG_TMP0,
-        emit_ctx.layout,
-        emit_ctx.dsl_ctx,
-    )?;
-    let right_reg = emit_load_cmp_value(
-        ir,
-        right,
-        expected_type,
-        REG_TMP1,
-        emit_ctx.layout,
-        emit_ctx.dsl_ctx,
-    )?;
+    let left_reg = emit_load_cmp_value(ir, left, expected_type, REG_TMP0, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+    let right_reg = emit_load_cmp_value(ir, right, expected_type, REG_TMP1, emit_ctx.layout, emit_ctx.dsl_ctx)?;
     let else_label = ir.new_label();
     let done_label = ir.new_label();
     ir.if_cmp(op.invert(), left_reg, right_reg, else_label);
@@ -2250,14 +2330,10 @@ fn value_contains_invoke(value: &DslValue) -> bool {
             value_contains_invoke(value)
         }
         DslValue::Cast { value, .. } => value_contains_invoke(value),
-        DslValue::ArrayGet { array, index, .. } => {
-            value_contains_invoke(array) || value_contains_invoke(index)
+        DslValue::ArrayGet { array, index, .. } => value_contains_invoke(array) || value_contains_invoke(index),
+        DslValue::FieldGet { .. } | DslValue::Target(_) | DslValue::String(_) | DslValue::Int(_) | DslValue::Null => {
+            false
         }
-        DslValue::FieldGet { .. }
-        | DslValue::Target(_)
-        | DslValue::String(_)
-        | DslValue::Int(_)
-        | DslValue::Null => false,
     }
 }
 
@@ -2273,7 +2349,10 @@ fn emit_invoke_with_values(
 ) -> Result<(), String> {
     let has_wide = params.iter().any(|param| matches!(param.as_str(), "J" | "D"));
     if args.iter().any(value_contains_invoke) {
-        return Err("call expressions cannot be nested inside invoke arguments; assign the value to a let binding first".to_string());
+        return Err(
+            "call expressions cannot be nested inside invoke arguments; assign the value to a let binding first"
+                .to_string(),
+        );
     }
     let mut regs = Vec::new();
     if let Some((receiver_reg, _)) = receiver {
@@ -2458,21 +2537,17 @@ fn statements_max_invoke_words(stmts: &[DslStmt]) -> Result<u16, String> {
                 value_max_invoke_words(array)?.max(value_max_invoke_words(index)?)
             }
             DslStmt::ArrayPut {
-                array,
-                index,
-                value,
-                ..
+                array, index, value, ..
             } => value_max_invoke_words(array)?
                 .max(value_max_invoke_words(index)?)
                 .max(value_max_invoke_words(value)?),
-            DslStmt::FieldRead { stmt, .. } => stmt
-                .target
+            DslStmt::FieldRead { stmt, .. } => stmt.target.as_ref().map(|_| 0).unwrap_or(0),
+            DslStmt::FieldWrite { stmt, .. } => stmt
+                .value
                 .as_ref()
-                .map(|_| 0)
+                .map(value_max_invoke_words)
+                .transpose()?
                 .unwrap_or(0),
-            DslStmt::FieldWrite { stmt, .. } => {
-                stmt.value.as_ref().map(value_max_invoke_words).transpose()?.unwrap_or(0)
-            }
             DslStmt::ReturnOrig => 0,
             DslStmt::ReturnValue { value } => value.as_ref().map(value_max_invoke_words).transpose()?.unwrap_or(0),
         };
@@ -2498,11 +2573,33 @@ fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
         DslValue::ArrayGet { array, index, .. } => {
             Ok(value_max_invoke_words(array)?.max(value_max_invoke_words(index)?))
         }
-        DslValue::FieldGet { .. }
-        | DslValue::Target(_)
-        | DslValue::String(_)
-        | DslValue::Int(_)
-        | DslValue::Null => Ok(0),
+        DslValue::FieldGet { .. } | DslValue::Target(_) | DslValue::String(_) | DslValue::Int(_) | DslValue::Null => {
+            Ok(0)
+        }
+    }
+}
+
+fn program_uses_orig(program: &DslProgram) -> bool {
+    statements_use_orig(&program.stmts)
+}
+
+fn statements_use_orig(stmts: &[DslStmt]) -> bool {
+    stmts.iter().any(stmt_uses_orig)
+}
+
+fn stmt_uses_orig(stmt: &DslStmt) -> bool {
+    match stmt {
+        DslStmt::ReturnOrig => true,
+        DslStmt::IfNull {
+            then_stmts, else_stmts, ..
+        }
+        | DslStmt::IfCmp {
+            then_stmts, else_stmts, ..
+        }
+        | DslStmt::IfInstanceOf {
+            then_stmts, else_stmts, ..
+        } => statements_use_orig(then_stmts) || statements_use_orig(else_stmts),
+        _ => false,
     }
 }
 
@@ -2520,11 +2617,7 @@ fn collect_local_slots_from_stmts(
 ) -> Result<(), String> {
     for stmt in stmts {
         match stmt {
-            DslStmt::Let {
-                name,
-                type_name,
-                ..
-            } => {
+            DslStmt::Let { name, type_name, .. } => {
                 if slots.contains_key(name) {
                     continue;
                 }
@@ -2533,34 +2626,22 @@ fn collect_local_slots_from_stmts(
                 *next = (*next)
                     .checked_add(descriptor_word_count(&descriptor))
                     .ok_or_else(|| "too many dex registers".to_string())?;
-                slots.insert(
-                    name.clone(),
-                    LocalSlot {
-                        reg,
-                        descriptor,
-                    },
-                );
+                slots.insert(name.clone(), LocalSlot { reg, descriptor });
             }
             DslStmt::IfNull {
-                then_stmts,
-                else_stmts,
-                ..
+                then_stmts, else_stmts, ..
             } => {
                 collect_local_slots_from_stmts(then_stmts, slots, next)?;
                 collect_local_slots_from_stmts(else_stmts, slots, next)?;
             }
             DslStmt::IfCmp {
-                then_stmts,
-                else_stmts,
-                ..
+                then_stmts, else_stmts, ..
             } => {
                 collect_local_slots_from_stmts(then_stmts, slots, next)?;
                 collect_local_slots_from_stmts(else_stmts, slots, next)?;
             }
             DslStmt::IfInstanceOf {
-                then_stmts,
-                else_stmts,
-                ..
+                then_stmts, else_stmts, ..
             } => {
                 collect_local_slots_from_stmts(then_stmts, slots, next)?;
                 collect_local_slots_from_stmts(else_stmts, slots, next)?;
@@ -2578,11 +2659,15 @@ struct EmitContext<'a> {
     local_count: u16,
     ins_size: u16,
     target: &'a MethodRef,
+    orig_arm_method: Option<&'a MethodRef>,
     return_type: &'a str,
     sink: &'a FieldRef,
 }
 
 fn emit_return_orig(ir: &mut DexIrBuilder, emit_ctx: &EmitContext<'_>) -> Result<(), String> {
+    if let Some(orig_arm_method) = emit_ctx.orig_arm_method {
+        ir.invoke_static(Vec::new(), orig_arm_method.clone());
+    }
     if emit_ctx.is_static {
         ir.invoke_static_range(emit_ctx.local_count, emit_ctx.ins_size as u8, emit_ctx.target.clone());
     } else {
@@ -2605,7 +2690,10 @@ fn emit_return_value(
         }
         "J" | "D" => {
             let Some(value) = value else {
-                return Err(format!("method returning {} requires return value", emit_ctx.return_type));
+                return Err(format!(
+                    "method returning {} requires return value",
+                    emit_ctx.return_type
+                ));
             };
             let reg = emit_load_value(
                 ir,
@@ -2619,7 +2707,10 @@ fn emit_return_value(
         }
         ret if return_is_object(ret) => {
             let Some(value) = value else {
-                return Err(format!("method returning {} requires return value", emit_ctx.return_type));
+                return Err(format!(
+                    "method returning {} requires return value",
+                    emit_ctx.return_type
+                ));
             };
             let reg = emit_load_value(
                 ir,
@@ -2633,7 +2724,10 @@ fn emit_return_value(
         }
         "Z" | "B" | "C" | "S" | "I" | "F" => {
             let Some(value) = value else {
-                return Err(format!("method returning {} requires return value", emit_ctx.return_type));
+                return Err(format!(
+                    "method returning {} requires return value",
+                    emit_ctx.return_type
+                ));
             };
             let reg = emit_load_value(
                 ir,
@@ -2650,17 +2744,9 @@ fn emit_return_value(
     Ok(())
 }
 
-fn emit_statement(
-    ir: &mut DexIrBuilder,
-    stmt: &DslStmt,
-    emit_ctx: &mut EmitContext<'_>,
-) -> Result<bool, String> {
+fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitContext<'_>) -> Result<bool, String> {
     match stmt {
-        DslStmt::Let {
-            name,
-            type_name,
-            value,
-        } => {
+        DslStmt::Let { name, type_name, value } => {
             emit_let(ir, name, type_name, value, emit_ctx.layout, emit_ctx.dsl_ctx)?;
             Ok(false)
         }
@@ -2680,10 +2766,7 @@ fn emit_statement(
             )?;
             Ok(false)
         }
-        DslStmt::NewArray {
-            array_type_name,
-            size,
-        } => {
+        DslStmt::NewArray { array_type_name, size } => {
             emit_new_array(
                 ir,
                 array_type_name,
@@ -2720,15 +2803,7 @@ fn emit_statement(
             type_name,
             value,
         } => {
-            emit_array_put(
-                ir,
-                array,
-                index,
-                type_name,
-                value,
-                emit_ctx.layout,
-                emit_ctx.dsl_ctx,
-            )?;
+            emit_array_put(ir, array, index, type_name, value, emit_ctx.layout, emit_ctx.dsl_ctx)?;
             Ok(false)
         }
         DslStmt::FieldRead { stmt, is_static } => {
@@ -2769,11 +2844,7 @@ fn emit_statement(
     }
 }
 
-fn emit_statements(
-    ir: &mut DexIrBuilder,
-    stmts: &[DslStmt],
-    emit_ctx: &mut EmitContext<'_>,
-) -> Result<bool, String> {
+fn emit_statements(ir: &mut DexIrBuilder, stmts: &[DslStmt], emit_ctx: &mut EmitContext<'_>) -> Result<bool, String> {
     for stmt in stmts {
         if emit_statement(ir, stmt, emit_ctx)? {
             return Ok(true);
@@ -2791,6 +2862,7 @@ pub(super) fn build_managed_dsl_dex(
     dsl: &str,
 ) -> Result<GeneratedManagedDex, String> {
     let program = parse_managed_dsl(dsl)?;
+    let uses_orig = program_uses_orig(&program);
     let target_type = java_class_to_descriptor(target_class_name)?;
     let object_type = "Ljava/lang/Object;".to_string();
     let (target_params, return_type) = parse_method_signature(target_sig)?;
@@ -2820,7 +2892,10 @@ pub(super) fn build_managed_dsl_dex(
         .ok_or_else(|| "too many dex registers".to_string())?;
     let outs_size = std::cmp::max(1u16, std::cmp::max(ins_size, max_invoke_words));
     if registers_size > u8::MAX as u16 {
-        return Err(format!("too many dex registers for generated helper: {}", registers_size));
+        return Err(format!(
+            "too many dex registers for generated helper: {}",
+            registers_size
+        ));
     }
 
     let generated_type = format!("Lrustfrida/DynManagedHook{};", class_id);
@@ -2833,6 +2908,16 @@ pub(super) fn build_managed_dsl_dex(
         return_type.clone(),
         target_params.clone(),
     );
+    let orig_arm_method = if uses_orig {
+        Some(MethodRef::new(
+            generated_type.clone(),
+            MANAGED_ORIG_NATIVE_NAME.to_string(),
+            "V".to_string(),
+            Vec::new(),
+        ))
+    } else {
+        None
+    };
 
     let mut ir = DexIrBuilder::new(registers_size, ins_size, outs_size);
     let layout = helper_param_layout(is_static, &target_type, &target_params, local_count, local_slots)?;
@@ -2843,6 +2928,7 @@ pub(super) fn build_managed_dsl_dex(
         local_count,
         ins_size,
         target: &target,
+        orig_arm_method: orig_arm_method.as_ref(),
         return_type: &return_type,
         sink: &sink,
     };
@@ -2855,7 +2941,19 @@ pub(super) fn build_managed_dsl_dex(
     let mut class = DexClass::new(generated_type.clone()).source_file("RustFridaDynamicManagedHook.java");
     class.static_field("sink", &object_type, ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE);
     for lit in &dsl_ctx.string_literals {
-        class.static_field(&lit.field_name, "Ljava/lang/String;", ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE);
+        class.static_field(
+            &lit.field_name,
+            "Ljava/lang/String;",
+            ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE,
+        );
+    }
+    if uses_orig {
+        class.native_direct_method(
+            MANAGED_ORIG_NATIVE_NAME,
+            "V",
+            Vec::new(),
+            ACC_PRIVATE | ACC_STATIC | ACC_NATIVE,
+        );
     }
     class.direct_method(
         "hook",
@@ -2875,6 +2973,7 @@ pub(super) fn build_managed_dsl_dex(
         class_name: generated_class_name,
         method_name: "hook".to_string(),
         method_sig: build_method_sig(&helper_params, &return_type),
+        orig_native: uses_orig,
         string_literals: dsl_ctx.string_literals,
     })
 }
@@ -2917,8 +3016,14 @@ enum DslStmt {
         type_name: String,
         value: DslValue,
     },
-    FieldRead { stmt: DslFieldStmt, is_static: bool },
-    FieldWrite { stmt: DslFieldStmt, is_static: bool },
+    FieldRead {
+        stmt: DslFieldStmt,
+        is_static: bool,
+    },
+    FieldWrite {
+        stmt: DslFieldStmt,
+        is_static: bool,
+    },
     IfNull {
         value: DslValue,
         invert: bool,
@@ -2976,7 +3081,10 @@ enum DslValue {
     AddLit(Box<DslValue>, i8),
     SubLit(Box<DslValue>, i8),
     Call(DslCallStmt),
-    FieldGet { stmt: Box<DslFieldStmt>, is_static: bool },
+    FieldGet {
+        stmt: Box<DslFieldStmt>,
+        is_static: bool,
+    },
     Cast {
         value: Box<DslValue>,
         class_name: String,
@@ -3009,10 +3117,7 @@ impl DslValue {
     fn into_statement(self) -> Option<DslStmt> {
         match self {
             DslValue::Call(stmt) => Some(DslStmt::Call(stmt)),
-            DslValue::FieldGet { stmt, is_static } => Some(DslStmt::FieldRead {
-                stmt: *stmt,
-                is_static,
-            }),
+            DslValue::FieldGet { stmt, is_static } => Some(DslStmt::FieldRead { stmt: *stmt, is_static }),
             DslValue::Cast { value, class_name } => Some(DslStmt::Cast {
                 value: *value,
                 class_name,
@@ -3142,9 +3247,9 @@ impl<'a> DslParser<'a> {
                 };
             }
             self.expect_char(';')?;
-            return value.into_statement().ok_or_else(|| {
-                self.err("only method calls and field reads can be used as expression statements")
-            });
+            return value
+                .into_statement()
+                .ok_or_else(|| self.err("only method calls and field reads can be used as expression statements"));
         }
         Err(self.err(&format!("unknown managed DSL statement '{}'", name)))
     }
@@ -3805,11 +3910,7 @@ fn write_code_item(
     Ok(())
 }
 
-fn lookup_u16<K: Ord + std::fmt::Debug>(
-    map: &BTreeMap<K, u32>,
-    key: &K,
-    kind: &str,
-) -> Result<u16, String> {
+fn lookup_u16<K: Ord + std::fmt::Debug>(map: &BTreeMap<K, u32>, key: &K, kind: &str) -> Result<u16, String> {
     let value = *map
         .get(key)
         .ok_or_else(|| format!("missing {} index for {:?}", kind, key))?;
@@ -3938,12 +4039,7 @@ fn sha1_digest(bytes: &[u8]) -> [u8; 20] {
         let mut w = [0u32; 80];
         for i in 0..16 {
             let off = i * 4;
-            w[i] = u32::from_be_bytes([
-                chunk[off],
-                chunk[off + 1],
-                chunk[off + 2],
-                chunk[off + 3],
-            ]);
+            w[i] = u32::from_be_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);

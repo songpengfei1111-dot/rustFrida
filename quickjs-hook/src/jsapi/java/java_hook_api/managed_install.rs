@@ -12,10 +12,10 @@ use super::super::callback::*;
 use super::super::java_lua_fast_api::{compile_art_method_to_quick, RequestedCompileKind};
 use super::super::jni_core::*;
 use super::super::reflect::{decode_method_id, find_class_safe, get_app_classloader_local_ref};
-use super::install_support::{
-    create_class_global_ref, update_original_method_flags_for_hook, JavaHookInstallGuard,
+use super::install_support::{create_class_global_ref, update_original_method_flags_for_hook, JavaHookInstallGuard};
+use super::managed_dex_builder::{
+    build_managed_dsl_dex, GeneratedStringLiteral, MANAGED_ORIG_NATIVE_NAME, MANAGED_ORIG_NATIVE_SIG,
 };
-use super::managed_dex_builder::{build_managed_dsl_dex, GeneratedStringLiteral};
 
 struct DynamicManagedHelperRefs {
     class_global_ref: u64,
@@ -200,17 +200,64 @@ unsafe fn initialize_generated_string_literals(
             .map_err(|_| format!("string literal for {} contains NUL byte", lit.field_name))?;
         let jstr = new_string_utf(env, value.as_ptr());
         if jstr.is_null() || jni_check_exc(env) {
-            return Err(format!("NewStringUTF failed for generated string field {}", lit.field_name));
+            return Err(format!(
+                "NewStringUTF failed for generated string field {}",
+                lit.field_name
+            ));
         }
         set_static_object_field(env, helper_cls, field_id, jstr);
         delete_local_ref(env, jstr);
         if jni_check_exc(env) {
-            return Err(format!("SetStaticObjectField failed for generated string field {}", lit.field_name));
+            return Err(format!(
+                "SetStaticObjectField failed for generated string field {}",
+                lit.field_name
+            ));
         }
     }
     output_message(&format!(
         "[managedHook] initialized {} generated string literal field(s)",
         literals.len()
+    ));
+    Ok(())
+}
+
+unsafe fn register_managed_orig_native(
+    env: JniEnv,
+    helper_cls: *mut std::ffi::c_void,
+    original_method: u64,
+    trampoline_target: u64,
+    out_state: *mut *mut std::ffi::c_void,
+) -> Result<(), String> {
+    let native_body =
+        crate::ffi::hook::hook_create_managed_orig_bypass_native(original_method, trampoline_target, out_state);
+    if native_body.is_null() {
+        return Err("hook_create_managed_orig_bypass_native failed".to_string());
+    }
+
+    let register_natives: RegisterNativesFn = jni_fn!(env, RegisterNativesFn, JNI_REGISTER_NATIVES);
+    let name = CString::new(MANAGED_ORIG_NATIVE_NAME).unwrap();
+    let sig = CString::new(MANAGED_ORIG_NATIVE_SIG).unwrap();
+    let method = JniNativeMethod {
+        name: name.as_ptr(),
+        signature: sig.as_ptr(),
+        fn_ptr: native_body,
+    };
+    let rc = register_natives(env, helper_cls, &method, 1);
+    if rc != 0 || jni_check_exc(env) {
+        return Err(format!(
+            "RegisterNatives({}) failed rc={}",
+            MANAGED_ORIG_NATIVE_NAME, rc
+        ));
+    }
+    output_message(&format!(
+        "[managedHook] registered {} native body={:?} state={:?}",
+        MANAGED_ORIG_NATIVE_NAME,
+        native_body,
+        if out_state.is_null() {
+            std::ptr::null_mut()
+        } else {
+            *out_state
+        }
     ));
     Ok(())
 }
@@ -224,33 +271,32 @@ unsafe fn install_managed_method_helper(
     helper_method_name_str: &str,
     helper_method_sig_str: &str,
     label: &str,
+    orig_native: bool,
 ) -> Result<(), String> {
     let (art_method, _is_static) = resolve_art_method(env, class_name, method_name, actual_sig, false)?;
 
     init_java_registry();
     if crate::jsapi::callback_util::with_registry(&JAVA_HOOK_REGISTRY, |r| r.contains_key(&art_method)).unwrap_or(false)
     {
-        return Err(format!("{}.{}{} already hooked — unhook first", class_name, method_name, actual_sig));
+        return Err(format!(
+            "{}.{}{} already hooked — unhook first",
+            class_name, method_name, actual_sig
+        ));
     }
 
     let get_static_mid: GetStaticMethodIdFn = jni_fn!(env, GetStaticMethodIdFn, JNI_GET_STATIC_METHOD_ID);
     let helper_method_sig = CString::new(helper_method_sig_str).unwrap();
     let helper_method_name = CString::new(helper_method_name_str).unwrap();
-    let helper_method_id = get_static_mid(
-        env,
-        helper_cls,
-        helper_method_name.as_ptr(),
-        helper_method_sig.as_ptr(),
-    );
+    let helper_method_id = get_static_mid(env, helper_cls, helper_method_name.as_ptr(), helper_method_sig.as_ptr());
     if helper_method_id.is_null() || jni_check_exc(env) {
         let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
         delete_local_ref(env, helper_cls);
         return Err(format!("managed helper {} method not found", helper_method_name_str));
     }
-    let helper_art_method = decode_method_id(env, helper_cls, helper_method_id as u64, true);
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-    delete_local_ref(env, helper_cls);
+    let helper_art_method = decode_method_id(env, helper_cls, helper_method_id as u64, true);
     if helper_art_method == 0 {
+        delete_local_ref(env, helper_cls);
         return Err("managed helper ArtMethod decode failed".to_string());
     }
 
@@ -266,7 +312,14 @@ unsafe fn install_managed_method_helper(
         let compile = compile_art_method_to_quick(env, art_method, ep_offset, bridge, RequestedCompileKind::Auto);
         output_message(&format!(
             "[managedHook] compile original {}.{}{}: success={} compiled={} before={:#x} after={:#x} {}",
-            class_name, method_name, actual_sig, compile.success, compile.compiled, compile.before, compile.after, compile.message
+            class_name,
+            method_name,
+            actual_sig,
+            compile.success,
+            compile.compiled,
+            compile.before,
+            compile.after,
+            compile.message
         ));
         original_entry_point = read_entry_point(art_method, ep_offset);
     }
@@ -277,14 +330,34 @@ unsafe fn install_managed_method_helper(
         ));
     }
 
+    let mut orig_native_state: *mut std::ffi::c_void = std::ptr::null_mut();
+    if orig_native {
+        if let Err(e) = register_managed_orig_native(env, helper_cls, art_method, 0, &mut orig_native_state) {
+            delete_local_ref(env, helper_cls);
+            return Err(e);
+        }
+    }
+
     let helper_spec = get_art_method_spec(env, helper_art_method);
-    let helper_compile =
-        compile_art_method_to_quick(env, helper_art_method, helper_spec.entry_point_offset, bridge, RequestedCompileKind::Auto);
+    let helper_compile = compile_art_method_to_quick(
+        env,
+        helper_art_method,
+        helper_spec.entry_point_offset,
+        bridge,
+        RequestedCompileKind::Auto,
+    );
     output_message(&format!(
         "[managedHook] compile helper: success={} compiled={} before={:#x} after={:#x} {}",
-        helper_compile.success, helper_compile.compiled, helper_compile.before, helper_compile.after, helper_compile.message
+        helper_compile.success,
+        helper_compile.compiled,
+        helper_compile.before,
+        helper_compile.after,
+        helper_compile.message
     ));
-    if is_art_quick_entrypoint(read_entry_point(helper_art_method, helper_spec.entry_point_offset), bridge) {
+    if is_art_quick_entrypoint(
+        read_entry_point(helper_art_method, helper_spec.entry_point_offset),
+        bridge,
+    ) {
         return Err("managed helper still has shared ART entrypoint after compile".to_string());
     }
     let helper_entry_point = read_entry_point(helper_art_method, helper_spec.entry_point_offset);
@@ -305,11 +378,9 @@ unsafe fn install_managed_method_helper(
     update_original_method_flags_for_hook(art_method, spec.access_flags_offset, original_access_flags);
     install_guard.set_original_method_mutated();
 
-    let (hook_addr, stealth_flag) = super::super::art_controller::prepare_hook_target(
-        original_entry_point,
-        env as *mut std::ffi::c_void,
-    )
-    .map_err(|e| format!("prepare_hook_target: {}", e))?;
+    let (hook_addr, stealth_flag) =
+        super::super::art_controller::prepare_hook_target(original_entry_point, env as *mut std::ffi::c_void)
+            .map_err(|e| format!("prepare_hook_target: {}", e))?;
     let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
     let quick_trampoline = crate::ffi::hook::hook_install_managed_direct_router(
         hook_addr as *mut std::ffi::c_void,
@@ -321,8 +392,17 @@ unsafe fn install_managed_method_helper(
         art_method,
     );
     if quick_trampoline.is_null() {
+        delete_local_ref(env, helper_cls);
         return Err("hook_install_managed_direct_router failed".to_string());
     }
+    if !orig_native_state.is_null() {
+        crate::ffi::hook::hook_update_managed_orig_bypass_native(
+            orig_native_state,
+            art_method,
+            quick_trampoline as u64,
+        );
+    }
+    delete_local_ref(env, helper_cls);
     super::super::art_controller::try_fixup_trampoline_pub(quick_trampoline, original_entry_point);
     let per_method_hook_target = if !hooked_target.is_null() {
         Some(hooked_target as u64)
@@ -372,12 +452,7 @@ unsafe fn install_managed_method_helper(
     Ok(())
 }
 
-unsafe fn install_managed_dsl_inner(
-    class_name: &str,
-    method_name: &str,
-    sig: &str,
-    dsl: &str,
-) -> Result<(), String> {
+unsafe fn install_managed_dsl_inner(class_name: &str, method_name: &str, sig: &str, dsl: &str) -> Result<(), String> {
     let env = ensure_jni_initialized()?;
     let (_, is_static) = resolve_art_method(env, class_name, method_name, sig, false)?;
     let class_id = DYNAMIC_MANAGED_CLASS_ID.fetch_add(1, Ordering::Relaxed);
@@ -402,6 +477,7 @@ unsafe fn install_managed_dsl_inner(
         &generated.method_name,
         &generated.method_sig,
         "generic-dsl",
+        generated.orig_native,
     )
 }
 
@@ -419,7 +495,10 @@ unsafe fn extract_string_prop(
             if let Some(result) = result {
                 return Ok(result);
             }
-            return Err(throw_internal_error(ctx, format!("{} option '{}' must be a string", api, name)));
+            return Err(throw_internal_error(
+                ctx,
+                format!("{} option '{}' must be a string", api, name),
+            ));
         }
         value.free(ctx);
     }
@@ -451,13 +530,22 @@ unsafe fn extract_managed_hook_dsl_args(
 
     if argc >= 4 {
         let Some(class_name) = JSValue(*argv).to_string(ctx) else {
-            return Err(throw_internal_error(ctx, "managedHookDsl arg1 className must be a string"));
+            return Err(throw_internal_error(
+                ctx,
+                "managedHookDsl arg1 className must be a string",
+            ));
         };
         let Some(method_name) = JSValue(*argv.add(1)).to_string(ctx) else {
-            return Err(throw_internal_error(ctx, "managedHookDsl arg2 methodName must be a string"));
+            return Err(throw_internal_error(
+                ctx,
+                "managedHookDsl arg2 methodName must be a string",
+            ));
         };
         let Some(sig) = JSValue(*argv.add(2)).to_string(ctx) else {
-            return Err(throw_internal_error(ctx, "managedHookDsl arg3 signature must be a string"));
+            return Err(throw_internal_error(
+                ctx,
+                "managedHookDsl arg3 signature must be a string",
+            ));
         };
         let Some(dsl) = JSValue(*argv.add(3)).to_string(ctx) else {
             return Err(throw_internal_error(ctx, "managedHookDsl arg4 dsl must be a string"));
