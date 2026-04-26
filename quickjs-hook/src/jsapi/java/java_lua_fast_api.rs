@@ -95,6 +95,7 @@ const MIRROR_OBJECT_CLASS_OFFSET: usize = 0;
 const MIRROR_OBJECT_LOCK_WORD_OFFSET: usize = 4;
 const MAX_TLAB_FAST_OBJECT_SIZE: u32 = 1 << 20;
 const FAST_ART_HANDLE_SCOPE_CAPACITY: usize = 256;
+const FAST_ART_STACK_INVOKE_WORDS: usize = 64;
 
 #[repr(C)]
 struct FastArtHandleScope {
@@ -136,7 +137,7 @@ thread_local! {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum RequestedCompileKind {
+pub(crate) enum RequestedCompileKind {
     Auto,
     Fast,
     Baseline,
@@ -174,13 +175,13 @@ impl RequestedCompileKind {
     }
 }
 
-struct CompileResult {
-    before: u64,
-    after: u64,
-    success: bool,
-    compiled: bool,
-    kind: &'static str,
-    message: String,
+pub(crate) struct CompileResult {
+    pub(crate) before: u64,
+    pub(crate) after: u64,
+    pub(crate) success: bool,
+    pub(crate) compiled: bool,
+    pub(crate) kind: &'static str,
+    pub(crate) message: String,
 }
 
 fn lua_fast_methods() -> &'static Mutex<Vec<LuaFastMethod>> {
@@ -710,7 +711,7 @@ pub(crate) unsafe extern "C" fn js_java_jit_info(
     obj
 }
 
-unsafe fn compile_art_method_to_quick(
+pub(crate) unsafe fn compile_art_method_to_quick(
     env: JniEnv,
     art_method: u64,
     entry_point_offset: usize,
@@ -945,6 +946,41 @@ pub(crate) unsafe fn invoke_lua_fast_method_art_on_thread(
     Ok(ret)
 }
 
+pub(crate) unsafe fn invoke_lua_fast_method_raw_on_thread(
+    method: &LuaFastMethod,
+    thread: u64,
+    receiver: u64,
+    args: &[u64],
+) -> Result<u64, String> {
+    if thread == 0 {
+        return Err("current ART Thread is null".to_string());
+    }
+    if !method.is_static && receiver == 0 {
+        return Err("jcall instance receiver is null".to_string());
+    }
+    if args.len() != method.param_types.len() {
+        return Err(format!(
+            "jcall argument count mismatch: expected {}, got {}",
+            method.param_types.len(),
+            args.len()
+        ));
+    }
+
+    let mut invoke_args = StackArtInvokeArgs::new();
+    if !method.is_static {
+        invoke_args.push("L", receiver)?;
+    }
+    for (i, type_sig) in method.param_types.iter().enumerate() {
+        invoke_args.push(type_sig.as_str(), args[i])?;
+    }
+    let before_exception = thread_exception(thread);
+    let ret = invoke_lua_fast_method_art_ready_raw(method, thread, invoke_args.as_mut_ptr(), invoke_args.size_bytes())?;
+    if clear_new_thread_exception(thread, before_exception) {
+        return Err("ArtMethod::Invoke method raised exception".to_string());
+    }
+    Ok(ret)
+}
+
 pub(crate) unsafe fn lua_fast_method_receiver_is_exact(method: &LuaFastMethod, receiver: u64) -> bool {
     method.is_static || object_class_matches(receiver, method.class_mirror)
 }
@@ -962,6 +998,20 @@ unsafe fn invoke_lua_fast_method_art_ready(
     thread: u64,
     invoke_args: &mut Vec<u32>,
 ) -> Result<u64, String> {
+    invoke_lua_fast_method_art_ready_raw(
+        method,
+        thread,
+        invoke_args.as_mut_ptr(),
+        (invoke_args.len() * std::mem::size_of::<u32>()) as u32,
+    )
+}
+
+unsafe fn invoke_lua_fast_method_art_ready_raw(
+    method: &LuaFastMethod,
+    thread: u64,
+    args: *mut u32,
+    args_size: u32,
+) -> Result<u64, String> {
     let Some(invoke) = art_method_invoke() else {
         return Err("ArtMethod::Invoke symbol not found".to_string());
     };
@@ -969,8 +1019,8 @@ unsafe fn invoke_lua_fast_method_art_ready(
     invoke(
         method.art_method as *mut std::ffi::c_void,
         thread as *mut std::ffi::c_void,
-        invoke_args.as_mut_ptr(),
-        (invoke_args.len() * std::mem::size_of::<u32>()) as u32,
+        args,
+        args_size,
         &mut result as *mut u64,
         method.shorty.as_ptr(),
     );
@@ -1085,10 +1135,57 @@ pub(crate) unsafe fn invoke_lua_fast_constructor_art_on_thread(
     Ok(())
 }
 
+pub(crate) unsafe fn invoke_lua_fast_constructor_raw_on_thread(
+    ctor: &LuaFastConstructor,
+    thread: u64,
+    receiver: u64,
+    args: &[u64],
+) -> Result<(), String> {
+    if thread == 0 {
+        return Err("current ART Thread is null".to_string());
+    }
+    if receiver == 0 {
+        return Err("jnew receiver allocation returned null".to_string());
+    }
+    if args.len() != ctor.param_types.len() {
+        return Err(format!(
+            "jnew argument count mismatch: expected {}, got {}",
+            ctor.param_types.len(),
+            args.len()
+        ));
+    }
+
+    let mut invoke_args = StackArtInvokeArgs::new();
+    invoke_args.push("L", receiver)?;
+    for (i, type_sig) in ctor.param_types.iter().enumerate() {
+        invoke_args.push(type_sig.as_str(), args[i])?;
+    }
+    let before_exception = thread_exception(thread);
+    invoke_lua_fast_constructor_art_ready_raw(ctor, thread, invoke_args.as_mut_ptr(), invoke_args.size_bytes())?;
+    if clear_new_thread_exception(thread, before_exception) {
+        return Err("ArtMethod::Invoke constructor raised exception".to_string());
+    }
+    Ok(())
+}
+
 unsafe fn invoke_lua_fast_constructor_art_ready(
     ctor: &LuaFastConstructor,
     thread: u64,
     invoke_args: &mut Vec<u32>,
+) -> Result<(), String> {
+    invoke_lua_fast_constructor_art_ready_raw(
+        ctor,
+        thread,
+        invoke_args.as_mut_ptr(),
+        (invoke_args.len() * std::mem::size_of::<u32>()) as u32,
+    )
+}
+
+unsafe fn invoke_lua_fast_constructor_art_ready_raw(
+    ctor: &LuaFastConstructor,
+    thread: u64,
+    args: *mut u32,
+    args_size: u32,
 ) -> Result<(), String> {
     let Some(invoke) = art_method_invoke() else {
         return Err("ArtMethod::Invoke symbol not found".to_string());
@@ -1097,8 +1194,8 @@ unsafe fn invoke_lua_fast_constructor_art_ready(
     invoke(
         ctor.art_method as *mut std::ffi::c_void,
         thread as *mut std::ffi::c_void,
-        invoke_args.as_mut_ptr(),
-        (invoke_args.len() * std::mem::size_of::<u32>()) as u32,
+        args,
+        args_size,
         &mut result as *mut u64,
         ctor.shorty.as_ptr(),
     );
@@ -1256,8 +1353,8 @@ pub(crate) unsafe fn with_lua_fast_art_handle_scope<R>(thread: u64, f: impl FnOn
 
     let top_addr = (thread as usize + spec.top_handle_scope_offset) as *mut u64;
     let previous_top = std::ptr::read_volatile(top_addr);
-    let mut scope = Box::new(FastArtHandleScope::new(previous_top));
-    let scope_ptr = (&mut *scope) as *mut FastArtHandleScope;
+    let mut scope = FastArtHandleScope::new(previous_top);
+    let scope_ptr = &mut scope as *mut FastArtHandleScope;
     std::ptr::write_volatile(top_addr, scope_ptr as u64);
     let previous_tls = CURRENT_FAST_ART_HANDLE_SCOPE.with(|current| {
         let previous = current.get();
@@ -1275,7 +1372,7 @@ pub(crate) unsafe fn with_lua_fast_art_handle_scope<R>(thread: u64, f: impl FnOn
         std::ptr::write_volatile(top_addr, previous_top);
     } else {
         FAST_ART_HANDLE_SCOPE_LEAKED.fetch_add(1, Ordering::Relaxed);
-        std::mem::forget(scope);
+        std::ptr::write_volatile(top_addr, previous_top);
         return result;
     }
     result
@@ -1443,6 +1540,49 @@ fn push_art_invoke_arg(out: &mut Vec<u32>, type_sig: &str, raw: u64) {
         Some(b'F') => out.push(raw as u32),
         Some(b'L' | b'[') => out.push(raw as u32),
         _ => out.push(raw as u32),
+    }
+}
+
+struct StackArtInvokeArgs {
+    words: [u32; FAST_ART_STACK_INVOKE_WORDS],
+    len: usize,
+}
+
+impl StackArtInvokeArgs {
+    fn new() -> Self {
+        Self {
+            words: [0; FAST_ART_STACK_INVOKE_WORDS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, type_sig: &str, raw: u64) -> Result<(), String> {
+        match type_sig.as_bytes().first().copied() {
+            Some(b'J' | b'D') => {
+                self.push_word(raw as u32)?;
+                self.push_word((raw >> 32) as u32)
+            }
+            Some(b'F') => self.push_word(raw as u32),
+            Some(b'L' | b'[') => self.push_word(raw as u32),
+            _ => self.push_word(raw as u32),
+        }
+    }
+
+    fn push_word(&mut self, word: u32) -> Result<(), String> {
+        if self.len >= self.words.len() {
+            return Err("ArtMethod::Invoke argument buffer exceeded fast stack capacity".to_string());
+        }
+        self.words[self.len] = word;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u32 {
+        self.words.as_mut_ptr()
+    }
+
+    fn size_bytes(&self) -> u32 {
+        (self.len * std::mem::size_of::<u32>()) as u32
     }
 }
 

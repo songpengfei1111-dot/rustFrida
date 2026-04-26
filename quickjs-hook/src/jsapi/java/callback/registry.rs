@@ -22,6 +22,14 @@ pub(super) enum HookType {
         per_method_hook_target: Option<u64>,
         declaring_class_source: u64,
     },
+    /// Replacement is a real ART-managed Java method loaded from helper dex.
+    /// It must not be freed or have declaring_class_ synchronized from the
+    /// hooked method.
+    Managed {
+        replacement_art_method: u64,
+        sentinel_addr: usize,
+        per_method_hook_target: Option<u64>,
+    },
 }
 
 pub(super) struct JavaHookData {

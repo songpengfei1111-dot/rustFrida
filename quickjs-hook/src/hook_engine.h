@@ -350,6 +350,7 @@ int hook_art_router_table_add_quick(uint64_t original, uint64_t replacement,
                                     HookCallback callback, void* user_data);
 
 void hook_art_router_table_set_mode(uint64_t original, uint64_t mode);
+void hook_art_router_table_set_user_data(uint64_t original, void* user_data);
 
 /*
  * Remove an entry from the ART router lookup table.
@@ -381,7 +382,7 @@ int hook_art_router_record_do_call(uint64_t method);
 /* Fast $orig bypass — skip art_router prologue+scan when callOriginal is in progress.
  * Array of per-thread slots checked at thunk entry BEFORE register save.
  * Each slot: {thread_id, method(ArtMethod*), trampoline, pad} = 32 bytes. */
-#define ORIG_BYPASS_SLOTS 4
+#define ORIG_BYPASS_SLOTS 32
 
 typedef struct {
     volatile uint64_t thread;       /* thread ID (TPIDR_EL0), 0 = free slot */
@@ -393,6 +394,8 @@ typedef struct {
 extern OrigBypassState g_orig_bypass[ORIG_BYPASS_SLOTS];
 extern volatile uint64_t g_orig_bypass_active;  /* >0 when any slot in use */
 extern volatile uint64_t g_orig_bypass_hit;     /* debug counter */
+extern volatile uint64_t g_orig_bypass_set_success; /* debug counter */
+extern volatile uint64_t g_orig_bypass_set_fail;    /* debug counter */
 
 /* Set/clear a fast $orig bypass slot (entry-level: thunk skips prologue+scan).
  * orig_bypass_set: atomically claim a free slot, write thread+method+trampoline.
@@ -467,6 +470,17 @@ void hook_art_router_get_route_stats(uint64_t* quick_hits,
 void hook_art_router_reset_debug(void);
 
 /*
+ * Debug: managed Java helper backup tail-stub hit counter.
+ */
+uint64_t* hook_managed_backup_stub_hit_counter_addr(void);
+uint64_t hook_managed_backup_stub_hits(void);
+uint64_t hook_managed_direct_hits(void);
+uint64_t hook_orig_bypass_hits(void);
+uint64_t hook_orig_bypass_set_successes(void);
+uint64_t hook_orig_bypass_set_failures(void);
+uint64_t hook_orig_bypass_active_count(void);
+
+/*
  * Install an ART method router hook with inline table lookup.
  *
  * Generates a routing trampoline that:
@@ -492,6 +506,14 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
                                int skip_resolve,
                                uint64_t current_pc_hint,
                                int use_blr);
+
+void* hook_install_managed_direct_router(void* target,
+                                         int stealth,
+                                         void* jni_env,
+                                         void** out_hooked_target,
+                                         uint64_t helper_method,
+                                         uint64_t helper_entry,
+                                         uint64_t original_method);
 
 /*
  * Return the generated ART router thunk body for a hooked quickCode target.

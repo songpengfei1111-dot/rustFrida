@@ -206,6 +206,21 @@ pub(super) type GetStaticDoubleFieldFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> f64;
 pub(super) type GetStaticObjectFieldFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+pub(super) type NewDirectByteBufferFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i64) -> *mut std::ffi::c_void;
+pub(super) type RegisterNativesFn = unsafe extern "C" fn(
+    JniEnv,
+    *mut std::ffi::c_void,
+    *const JniNativeMethod,
+    i32,
+) -> i32;
+
+#[repr(C)]
+pub(super) struct JniNativeMethod {
+    pub(super) name: *const c_char,
+    pub(super) signature: *const c_char,
+    pub(super) fn_ptr: *mut std::ffi::c_void,
+}
 
 /// Call a JNI function from the function table by index.
 /// JNIEnv is `JNINativeInterface**` — (*env)[index] is the function pointer.
@@ -350,18 +365,22 @@ unsafe fn clear_exc(env: JniEnv) {
 /// Check if a 64-bit value looks like a valid ARM64 code pointer.
 /// Strips PAC/TBI high bits (bits 48-63) before checking, since entry_point
 /// values may carry PAC signatures or MTE tags on supported devices.
-/// After stripping, verifies via dladdr that the address is in a mapped executable region.
+///
+/// Do not rely on dladdr() here. ART trampolines may live in boot oat/image
+/// mappings that are executable but do not resolve to a dynamic symbol.
 pub(super) fn is_code_pointer(val: u64) -> bool {
-    // Strip PAC/TBI bits to get the bare virtual address (48-bit canonical form)
     let stripped = val & PAC_STRIP_MASK;
     if stripped == 0 {
         return false;
     }
-    // Verify it resolves via dladdr (mapped executable memory)
-    unsafe {
-        let mut info: libc::Dl_info = std::mem::zeroed();
-        libc::dladdr(stripped as *const std::ffi::c_void, &mut info) != 0
-    }
+    crate::jsapi::util::read_proc_self_maps()
+        .as_deref()
+        .map(|maps| {
+            crate::jsapi::util::proc_maps_entries(maps).any(|entry| {
+                entry.contains(stripped) && (entry.prot_flags() & libc::PROT_EXEC) != 0
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// 缓存的 Android API level
@@ -771,8 +790,10 @@ pub(super) const JNI_NEW_GLOBAL_REF: usize = 21;
 pub(super) const JNI_NEW_LOCAL_REF: usize = 25;
 pub(super) const JNI_MONITOR_ENTER: usize = 217;
 pub(super) const JNI_MONITOR_EXIT: usize = 218;
+pub(super) const JNI_REGISTER_NATIVES: usize = 215;
 pub(super) const JNI_GET_PRIMITIVE_ARRAY_CRITICAL: usize = 222;
 pub(super) const JNI_RELEASE_PRIMITIVE_ARRAY_CRITICAL: usize = 223;
+pub(super) const JNI_NEW_DIRECT_BYTE_BUFFER: usize = 229;
 pub(super) const JNI_GET_FIELD_ID: usize = 94;
 pub(super) const JNI_GET_OBJECT_FIELD: usize = 95;
 pub(super) const JNI_GET_BOOLEAN_FIELD: usize = 96;

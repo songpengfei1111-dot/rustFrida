@@ -30,11 +30,15 @@ volatile uint64_t g_art_router_quick_test_suspend_entrypoint = 0;
 volatile uint64_t g_art_router_replacement_hit_count = 0;
 volatile uint64_t g_art_router_do_call_table_hit_count = 0;
 volatile uint64_t g_art_router_last_do_call_x0 = 0;
+volatile uint64_t g_managed_backup_stub_hit_count = 0;
+volatile uint64_t g_managed_direct_hit_count = 0;
 
 /* Fast $orig bypass state */
 OrigBypassState g_orig_bypass[ORIG_BYPASS_SLOTS] = {{0}};
 volatile uint64_t g_orig_bypass_active = 0;
 volatile uint64_t g_orig_bypass_hit = 0;
+volatile uint64_t g_orig_bypass_set_success = 0;
+volatile uint64_t g_orig_bypass_set_fail = 0;
 
 /* ============================================================================
  * ART router table management
@@ -96,6 +100,16 @@ void hook_art_router_table_set_mode(uint64_t original, uint64_t mode) {
         if (g_art_router_table[i].original == 0) break;
         if (g_art_router_table[i].original == original) {
             g_art_router_table[i].mode = mode;
+            return;
+        }
+    }
+}
+
+void hook_art_router_table_set_user_data(uint64_t original, void* user_data) {
+    for (int i = 0; i < ART_ROUTER_TABLE_MAX; i++) {
+        if (g_art_router_table[i].original == 0) break;
+        if (g_art_router_table[i].original == original) {
+            g_art_router_table[i].quick_user_data = user_data;
             return;
         }
     }
@@ -218,6 +232,39 @@ void hook_art_router_reset_debug(void) {
     g_art_router_replacement_hit_count = 0;
     g_art_router_do_call_table_hit_count = 0;
     g_art_router_last_do_call_x0 = 0;
+    __atomic_store_n(&g_managed_backup_stub_hit_count, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_managed_direct_hit_count, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_orig_bypass_hit, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_orig_bypass_set_success, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_orig_bypass_set_fail, 0, __ATOMIC_RELAXED);
+}
+
+uint64_t* hook_managed_backup_stub_hit_counter_addr(void) {
+    return (uint64_t*)&g_managed_backup_stub_hit_count;
+}
+
+uint64_t hook_managed_backup_stub_hits(void) {
+    return __atomic_load_n(&g_managed_backup_stub_hit_count, __ATOMIC_RELAXED);
+}
+
+uint64_t hook_managed_direct_hits(void) {
+    return __atomic_load_n(&g_managed_direct_hit_count, __ATOMIC_RELAXED);
+}
+
+uint64_t hook_orig_bypass_hits(void) {
+    return __atomic_load_n(&g_orig_bypass_hit, __ATOMIC_RELAXED);
+}
+
+uint64_t hook_orig_bypass_set_successes(void) {
+    return __atomic_load_n(&g_orig_bypass_set_success, __ATOMIC_RELAXED);
+}
+
+uint64_t hook_orig_bypass_set_failures(void) {
+    return __atomic_load_n(&g_orig_bypass_set_fail, __ATOMIC_RELAXED);
+}
+
+uint64_t hook_orig_bypass_active_count(void) {
+    return __atomic_load_n(&g_orig_bypass_active, __ATOMIC_RELAXED);
 }
 
 void hook_art_router_get_hit_debug(uint64_t* hit_count, uint64_t* last_hit_x0) {
@@ -281,6 +328,9 @@ void hook_art_router_get_route_stats(uint64_t* quick_hits,
 /* TPIDR_EL0 system register encoding */
 #define SYSREG_TPIDR_EL0 0xDE82
 
+static void emit_atomic_inc64(Arm64Writer* w, volatile uint64_t* counter);
+static void emit_atomic_dec64(Arm64Writer* w, volatile uint64_t* counter);
+
 /* Fast $orig bypass: checked BEFORE prologue (zero register save overhead).
  * Scans g_orig_bypass slots for matching thread+method, jumps to trampoline.
  * Only clobbers X16/X17 (scratch registers). */
@@ -305,12 +355,48 @@ static void emit_art_router_fast_bypass(Arm64Writer* w, uint64_t lbl_normal) {
         arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X17, 0);
         arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X17, ARM64_REG_X0);
         arm64_writer_put_b_cond_label(w, ARM64_COND_NE, lbl_next);
-        /* Match! Jump to trampoline */
+        /* Match! One-shot clear the slot and jump to trampoline.
+         * Preserve x0-x15 exactly; the original quick entry still needs the
+         * original ArtMethod and Java arguments. */
+        arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&slot->thread);
+        arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_XZR, ARM64_REG_X17, 0);
+        emit_atomic_dec64(w, &g_orig_bypass_active);
+        emit_atomic_inc64(w, &g_orig_bypass_hit);
         arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&slot->thread);
         arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 16); /* trampoline */
         arm64_writer_put_br_reg(w, ARM64_REG_X16);
         arm64_writer_put_label(w, lbl_next);
     }
+}
+
+static void emit_atomic_inc64(Arm64Writer* w, volatile uint64_t* counter) {
+    uint64_t lbl_retry = arm64_writer_new_label_id(w);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)counter);
+    arm64_writer_put_label(w, lbl_retry);
+    /* LDXR X17, [X16] */
+    arm64_writer_put_insn(w, 0xC85F7C00 | (ARM64_REG_NUM(ARM64_REG_X16) << 5) | ARM64_REG_NUM(ARM64_REG_X17));
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X17, ARM64_REG_X17, 1);
+    /* STXR W15, X17, [X16] */
+    arm64_writer_put_insn(w, 0xC8007C00
+                             | (ARM64_REG_NUM(ARM64_REG_W15) << 16)
+                             | (ARM64_REG_NUM(ARM64_REG_X16) << 5)
+                             | ARM64_REG_NUM(ARM64_REG_X17));
+    arm64_writer_put_cbnz_reg_label(w, ARM64_REG_W15, lbl_retry);
+}
+
+static void emit_atomic_dec64(Arm64Writer* w, volatile uint64_t* counter) {
+    uint64_t lbl_retry = arm64_writer_new_label_id(w);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)counter);
+    arm64_writer_put_label(w, lbl_retry);
+    /* LDXR X17, [X16] */
+    arm64_writer_put_insn(w, 0xC85F7C00 | (ARM64_REG_NUM(ARM64_REG_X16) << 5) | ARM64_REG_NUM(ARM64_REG_X17));
+    arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_X17, ARM64_REG_X17, 1);
+    /* STXR W15, X17, [X16] */
+    arm64_writer_put_insn(w, 0xC8007C00
+                             | (ARM64_REG_NUM(ARM64_REG_W15) << 16)
+                             | (ARM64_REG_NUM(ARM64_REG_X16) << 5)
+                             | ARM64_REG_NUM(ARM64_REG_X17));
+    arm64_writer_put_cbnz_reg_label(w, ARM64_REG_W15, lbl_retry);
 }
 
 /* --- Fast $orig bypass slot management (called from Rust) --- */
@@ -326,10 +412,22 @@ int orig_bypass_set(uint64_t thread, uint64_t method, uint64_t trampoline) {
             __atomic_thread_fence(__ATOMIC_RELEASE);
             slot->thread = thread;
             __atomic_add_fetch(&g_orig_bypass_active, 1, __ATOMIC_RELEASE);
+            __atomic_add_fetch(&g_orig_bypass_set_success, 1, __ATOMIC_RELAXED);
             return 0;
         }
     }
+    __atomic_add_fetch(&g_orig_bypass_set_fail, 1, __ATOMIC_RELAXED);
     return -1;
+}
+
+static uint64_t hook_current_tpidr_el0(void) {
+    uint64_t tpidr;
+    __asm__ __volatile__("mrs %0, tpidr_el0" : "=r"(tpidr));
+    return tpidr;
+}
+
+int orig_bypass_set_current_thread(uint64_t method, uint64_t trampoline) {
+    return orig_bypass_set(hook_current_tpidr_el0(), method, trampoline);
 }
 
 void orig_bypass_clear(uint64_t thread) {
@@ -923,13 +1021,73 @@ static void emit_art_router_found_path(Arm64Writer* w, uint64_t lbl_found,
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X17, 0);
 
     uint64_t lbl_quick = arm64_writer_new_label_id(w);
+    uint64_t lbl_replacement = arm64_writer_new_label_id(w);
+    uint64_t lbl_managed_replacement = arm64_writer_new_label_id(w);
+    uint64_t lbl_replacement_loaded = arm64_writer_new_label_id(w);
+    uint64_t lbl_skip_declaring_class_sync = arm64_writer_new_label_id(w);
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X16, 16);
-    arm64_writer_put_cbnz_reg_label(w, ARM64_REG_X0, lbl_quick);
+    arm64_writer_put_cbz_reg_label(w, ARM64_REG_X0, lbl_replacement);
+    arm64_writer_put_mov_reg_imm(w, ARM64_REG_X1, 4);
+    arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X0, ARM64_REG_X1);
+    arm64_writer_put_b_cond_label(w, ARM64_COND_EQ, lbl_managed_replacement);
+    arm64_writer_put_b_label(w, lbl_quick);
 
+    arm64_writer_put_label(w, lbl_replacement);
     emit_art_router_inc_counter(w, &g_art_router_replacement_hit_count);
 
     /* X16 points to matched table entry; load replacement ArtMethod* from offset 8 */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 8);
+    arm64_writer_put_b_label(w, lbl_replacement_loaded);
+
+    arm64_writer_put_label(w, lbl_managed_replacement);
+    emit_art_router_inc_counter(w, &g_art_router_replacement_hit_count);
+
+    /* Managed replacement is a real Java ArtMethod from helper dex. Do not
+     * synchronize declaring_class_ from the hooked method; that would corrupt
+     * the helper method's dex/class metadata. */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 8);
+    /* Keep a native sentinel in SP+0 while this fake-router PC is visible to
+     * ART stack walking. Then return x0=helper ArtMethod after popping the
+     * router frame, immediately before branching into helper quick code. */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X16, 32);
+    uint64_t lbl_managed_has_sentinel = arm64_writer_new_label_id(w);
+    arm64_writer_put_cbnz_reg_label(w, ARM64_REG_X0, lbl_managed_has_sentinel);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_X17);
+    arm64_writer_put_label(w, lbl_managed_has_sentinel);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
+
+    /* Recursion / callOriginal bypass check. Keep SP+0 as the native sentinel
+     * while calling into Rust, but pass the real helper ArtMethod so
+     * stack_replacement_source() can map helper -> original and honor the TLS
+     * fallback when the fixed-size fast bypass slots are full. */
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X20, ARM64_REG_X16);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X21, ARM64_REG_X17);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_X17);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)art_router_stack_check);
+    arm64_writer_put_blr_reg(w, ARM64_REG_X16);
+    uint64_t lbl_managed_continue = arm64_writer_new_label_id(w);
+    arm64_writer_put_cbnz_reg_label(w, ARM64_REG_X0, lbl_managed_continue);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X20, 0);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
+    arm64_writer_put_b_label(w, lbl_not_found);
+    arm64_writer_put_label(w, lbl_managed_continue);
+
+    /* The managed helper may call the hooked method again to obtain the
+     * original result. Use an explicit one-shot TLS bypass for that nested
+     * call instead of relying on WalkStack recursion detection. */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 0);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X1, trampoline_target);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)orig_bypass_set_current_thread);
+    arm64_writer_put_blr_reg(w, ARM64_REG_X16);
+
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X16, ARM64_REG_X20);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X17, ARM64_REG_X21);
+
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, quickcode_offset);
+    emit_art_router_restore_all_with_return_x0(w, ARM64_REG_X17);
+    arm64_writer_put_br_reg(w, ARM64_REG_X16);
+
+    arm64_writer_put_label(w, lbl_replacement_loaded);
 
     /* WalkStack 根治: 提前把 replacement 写到 SP+0, 覆盖 prologue 的 original.
      * 这样 ART StackVisitor 在本线程 (或 peer 线程) 读 *cur_quick_frame = *SP
@@ -960,10 +1118,18 @@ static void emit_art_router_found_path(Arm64Writer* w, uint64_t lbl_found,
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X16, ARM64_REG_X20);
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X17, ARM64_REG_X21);
 
+    arm64_writer_put_label(w, lbl_skip_declaring_class_sync);
+
     /* 同步 declaring_class_ (offset 0, 4 bytes): original → replacement */
+    uint64_t lbl_after_declaring_class_sync = arm64_writer_new_label_id(w);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 16);
+    arm64_writer_put_mov_reg_imm(w, ARM64_REG_X1, 4);
+    arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X0, ARM64_REG_X1);
+    arm64_writer_put_b_cond_label(w, ARM64_COND_EQ, lbl_after_declaring_class_sync);
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X16, 0);  /* X0 = original */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_W0, ARM64_REG_X0, 0);   /* W0 = original->declaring_class_ */
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_W0, ARM64_REG_X17, 0);  /* replacement->declaring_class_ = W0 */
+    arm64_writer_put_label(w, lbl_after_declaring_class_sync);
 
     /* SP+0 已提前置为 replacement (见上). restore_all 从 SP+0 读回 x0 → x0 = replacement. */
 
@@ -1161,10 +1327,7 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 0);
 
     /* Debug hit counter */
-    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_orig_bypass_hit);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 0);
-    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_X16, 1);
-    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 0);
+    emit_atomic_inc64(w, &g_orig_bypass_hit);
 
     emit_restore_args_only(w);
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_X20);
@@ -1426,6 +1589,178 @@ void* resolve_art_trampoline(void* target, void* jni_env) {
     return (void*)resolved;
 }
 
+static void emit_managed_direct_set_bypass(Arm64Writer* w, uint64_t original_method,
+                                           uint64_t trampoline_target) {
+    uint64_t lbl_done = arm64_writer_new_label_id(w);
+    uint64_t lbl_fail = arm64_writer_new_label_id(w);
+
+    for (int i = 0; i < ORIG_BYPASS_SLOTS; i++) {
+        OrigBypassState* slot = &g_orig_bypass[i];
+        uint64_t lbl_next = arm64_writer_new_label_id(w);
+        arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)&slot->thread);
+        /* LDXR X17, [X16] */
+        arm64_writer_put_insn(w, 0xC85F7C00 | (ARM64_REG_NUM(ARM64_REG_X16) << 5) | ARM64_REG_NUM(ARM64_REG_X17));
+        arm64_writer_put_cbnz_reg_label(w, ARM64_REG_X17, lbl_next);
+        arm64_writer_put_mov_reg_imm(w, ARM64_REG_X17, 1);
+        /* Claim the slot with STXR. A racing writer just falls through to the
+         * next slot; the final visible thread value is written only after
+         * method/trampoline are initialized. */
+        arm64_writer_put_insn(w, 0xC8007C00
+                                 | (ARM64_REG_NUM(ARM64_REG_W15) << 16)
+                                 | (ARM64_REG_NUM(ARM64_REG_X16) << 5)
+                                 | ARM64_REG_NUM(ARM64_REG_X17));
+        arm64_writer_put_cbnz_reg_label(w, ARM64_REG_W15, lbl_next);
+        arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, original_method);
+        arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 8);
+        arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, trampoline_target);
+        arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 16);
+        /* DMB ISH: publish method/trampoline before replacing the sentinel
+         * thread value with the real TPIDR_EL0. */
+        arm64_writer_put_insn(w, 0xD5033BBF);
+        arm64_writer_put_mrs_reg(w, ARM64_REG_X17, SYSREG_TPIDR_EL0);
+        arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 0);
+        emit_atomic_inc64(w, &g_orig_bypass_active);
+        emit_atomic_inc64(w, &g_orig_bypass_set_success);
+        arm64_writer_put_b_label(w, lbl_done);
+        arm64_writer_put_label(w, lbl_next);
+    }
+
+    arm64_writer_put_label(w, lbl_fail);
+    emit_atomic_inc64(w, &g_orig_bypass_set_fail);
+    arm64_writer_put_label(w, lbl_done);
+}
+
+static void emit_managed_direct_clear_bypass_current_thread(Arm64Writer* w) {
+    uint64_t lbl_done = arm64_writer_new_label_id(w);
+
+    arm64_writer_put_mrs_reg(w, ARM64_REG_X15, SYSREG_TPIDR_EL0);
+    for (int i = 0; i < ORIG_BYPASS_SLOTS; i++) {
+        OrigBypassState* slot = &g_orig_bypass[i];
+        uint64_t lbl_next = arm64_writer_new_label_id(w);
+
+        arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)&slot->thread);
+        arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 0);
+        arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X17, ARM64_REG_X15);
+        arm64_writer_put_b_cond_label(w, ARM64_COND_NE, lbl_next);
+
+        arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_XZR, ARM64_REG_X16, 0);
+        emit_atomic_dec64(w, &g_orig_bypass_active);
+        arm64_writer_put_b_label(w, lbl_done);
+        arm64_writer_put_label(w, lbl_next);
+    }
+
+    arm64_writer_put_label(w, lbl_done);
+}
+
+static size_t generate_managed_direct_thunk(void* thunk_mem, size_t thunk_alloc,
+                                            void* trampoline_target,
+                                            uint64_t helper_method,
+                                            uint64_t helper_entry,
+                                            uint64_t original_method) {
+    if (thunk_alloc < 2048) return 0;
+
+    Arm64Writer w;
+    arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, thunk_alloc);
+
+    uint64_t lbl_normal_path = arm64_writer_new_label_id(&w);
+    emit_art_router_fast_bypass(&w, lbl_normal_path);
+    arm64_writer_put_label(&w, lbl_normal_path);
+
+    emit_atomic_inc64(&w, &g_managed_direct_hit_count);
+
+    arm64_writer_put_stp_reg_reg_reg_offset(&w, ARM64_REG_X29, ARM64_REG_X30,
+                                            ARM64_REG_SP, -16, ARM64_INDEX_PRE_ADJUST);
+    emit_managed_direct_set_bypass(&w, original_method, (uint64_t)trampoline_target);
+    arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X0, helper_method);
+    arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, helper_entry);
+    arm64_writer_put_blr_reg(&w, ARM64_REG_X16);
+    emit_managed_direct_clear_bypass_current_thread(&w);
+    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X29, ARM64_REG_X30,
+                                            ARM64_REG_SP, 16, ARM64_INDEX_POST_ADJUST);
+    arm64_writer_put_ret(&w);
+
+    if (arm64_writer_flush(&w) != 0) {
+        hook_log("[managed_direct] label resolution failed");
+        return 0;
+    }
+    size_t size = arm64_writer_offset(&w);
+    hook_flush_cache(thunk_mem, size);
+    hook_log("[managed_direct] thunk size=%zu helper=%llx entry=%llx original=%llx trampoline=%p",
+             size, (unsigned long long)helper_method, (unsigned long long)helper_entry,
+             (unsigned long long)original_method, trampoline_target);
+    return size;
+}
+
+void* hook_install_managed_direct_router(void* target,
+                                         int stealth,
+                                         void* jni_env,
+                                         void** out_hooked_target,
+                                         uint64_t helper_method,
+                                         uint64_t helper_entry,
+                                         uint64_t original_method) {
+    if (!g_engine.initialized || !target || !helper_method || !helper_entry || !original_method) {
+        return NULL;
+    }
+
+    void* resolved = resolve_art_trampoline(target, jni_env);
+    if (resolved != target) {
+        target = resolved;
+    }
+    if (out_hooked_target) {
+        *out_hooked_target = target;
+    }
+
+    pthread_mutex_lock(&g_engine.lock);
+
+    HookEntry* existing = find_hook(target);
+    if (existing) {
+        void* trampoline = existing->trampoline;
+        pthread_mutex_unlock(&g_engine.lock);
+        return trampoline;
+    }
+
+    HookEntry* entry = setup_hook_entry(target);
+    if (!entry) {
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    size_t thunk_alloc = 16384;
+    if (!entry->thunk || entry->thunk_alloc < thunk_alloc) {
+        entry->thunk = hook_alloc_near(thunk_alloc, target);
+        entry->thunk_alloc = thunk_alloc;
+    }
+    if (!entry->thunk) {
+        free_entry(entry);
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    if (build_trampoline(entry, 0) < 0) {
+        free_entry(entry);
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    size_t thunk_size = generate_managed_direct_thunk(
+        entry->thunk, thunk_alloc, entry->trampoline, helper_method, helper_entry, original_method);
+    if (thunk_size == 0) {
+        free_entry(entry);
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    if (patch_target(target, entry->thunk, stealth, entry) != 0) {
+        free_entry(entry);
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    finalize_hook(entry, entry->thunk, thunk_size);
+    pthread_mutex_unlock(&g_engine.lock);
+    return entry->trampoline;
+}
+
 /* ============================================================================
  * hook_install_art_router — inline hook with ART router thunk
  *
@@ -1475,7 +1810,7 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
 
     /* Allocate thunk (router code — larger than default).
      * hook_alloc_near 按 ±128MB → ±4GB → 任意 三层分配。 */
-    size_t art_thunk_alloc = 8192;
+    size_t art_thunk_alloc = 16384;
     if (!entry->thunk || entry->thunk_alloc < art_thunk_alloc) {
         entry->thunk = hook_alloc_near(art_thunk_alloc, target);
         entry->thunk_alloc = art_thunk_alloc;
@@ -1556,7 +1891,7 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
 
     /* stub 通过 ArtMethod.entry_point_ 指针间接调用，不需要 near.
      * 布局: [12B 伪 OAT header/CodeInfo] [stub body]. 返回 body 起点. */
-    size_t stub_alloc = 2048;
+    size_t stub_alloc = 16384;
     void* stub_mem = hook_alloc(stub_alloc);
     if (!stub_mem) {
         pthread_mutex_unlock(&g_engine.lock);

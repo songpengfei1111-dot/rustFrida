@@ -588,6 +588,36 @@ unsafe extern "C" fn js_art_route_stats(
     );
     obj_val.set_property(
         ctx,
+        "managedBackupStubHits",
+        JSValue(ffi::JS_NewBigUint64(ctx, hook_ffi::hook_managed_backup_stub_hits())),
+    );
+    obj_val.set_property(
+        ctx,
+        "managedDirectHits",
+        JSValue(ffi::JS_NewBigUint64(ctx, hook_ffi::hook_managed_direct_hits())),
+    );
+    obj_val.set_property(
+        ctx,
+        "origBypassHits",
+        JSValue(ffi::JS_NewBigUint64(ctx, hook_ffi::hook_orig_bypass_hits())),
+    );
+    obj_val.set_property(
+        ctx,
+        "origBypassSetSuccesses",
+        JSValue(ffi::JS_NewBigUint64(ctx, hook_ffi::hook_orig_bypass_set_successes())),
+    );
+    obj_val.set_property(
+        ctx,
+        "origBypassSetFailures",
+        JSValue(ffi::JS_NewBigUint64(ctx, hook_ffi::hook_orig_bypass_set_failures())),
+    );
+    obj_val.set_property(
+        ctx,
+        "origBypassActive",
+        JSValue(ffi::JS_NewBigUint64(ctx, hook_ffi::hook_orig_bypass_active_count())),
+    );
+    obj_val.set_property(
+        ctx,
         "getOatHookPoolOriginal",
         JSValue(ffi::JS_NewBigUint64(
             ctx,
@@ -1106,6 +1136,7 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, java_obj, "hookQuick", js_java_hook_quick, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "luaHook", js_lua_hook, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "fastHook", js_fast_hook, 4);
+        add_cfunction_to_object(ctx_ptr, java_obj, "managedHookDsl", js_managed_hook_dsl, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "fastHookSig", js_fast_hook_signature, 1);
         add_cfunction_to_object(ctx_ptr, java_obj, "fastHookCheck", js_fast_hook_check, 2);
         add_cfunction_to_object(ctx_ptr, java_obj, "unhook", js_java_unhook, 3);
@@ -1255,6 +1286,9 @@ pub(super) unsafe fn remove_per_method_hook(data: &JavaHookData) {
         }
         | callback::HookType::Quick {
             per_method_hook_target, ..
+        }
+        | callback::HookType::Managed {
+            per_method_hook_target, ..
         } => {
             if let Some(target) = per_method_hook_target {
                 hook_ffi::hook_remove(*target as *mut std::ffi::c_void);
@@ -1275,6 +1309,7 @@ pub(super) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Opti
         callback::HookType::Replaced { replacement_addr, .. } | callback::HookType::Quick { replacement_addr, .. } => {
             *replacement_addr
         }
+        callback::HookType::Managed { sentinel_addr, .. } => *sentinel_addr,
     };
     if replacement_addr != 0 {
         libc::free(replacement_addr as *mut std::ffi::c_void);
@@ -1287,9 +1322,11 @@ pub(super) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Opti
         }
     }
 
-    let ctx = data.ctx as *mut ffi::JSContext;
-    let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
-    ffi::qjs_free_value(ctx, callback);
+    if data.ctx != 0 {
+        let ctx = data.ctx as *mut ffi::JSContext;
+        let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
+        ffi::qjs_free_value(ctx, callback);
+    }
 }
 
 /// Cleanup all Java hooks (call before dropping context)

@@ -1173,6 +1173,12 @@ fn stack_replacement_source(method: u64) -> Option<u64> {
                     data.art_method
                 });
             }
+            super::callback::HookType::Managed {
+                replacement_art_method,
+                ..
+            } if *replacement_art_method == method => {
+                return Some(data.art_method);
+            }
             _ => {}
         }
     }
@@ -1341,9 +1347,10 @@ unsafe fn synchronize_replacement_methods() {
                         data.art_method
                     },
                 ),
+                HookType::Managed { .. } => (0, 0),
             };
-            let declaring_class = std::ptr::read_volatile(declaring_class_source as *const u32);
-            if replacement_addr != 0 {
+            if replacement_addr != 0 && declaring_class_source != 0 {
+                let declaring_class = std::ptr::read_volatile(declaring_class_source as *const u32);
                 std::ptr::write_volatile(replacement_addr as *mut u32, declaring_class);
             }
         }
@@ -1364,6 +1371,9 @@ unsafe fn synchronize_replacement_methods() {
                 per_method_hook_target, ..
             }
             | HookType::Quick {
+                per_method_hook_target, ..
+            }
+            | HookType::Managed {
                 per_method_hook_target, ..
             } => per_method_hook_target,
         };

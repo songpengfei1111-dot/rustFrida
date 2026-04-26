@@ -20,6 +20,17 @@ pub(in crate::jsapi::java) fn set_replacement_method(original: u64, replacement:
     }
 }
 
+/// Register original -> real Java replacement ArtMethod. Router mode 4 uses
+/// the normal replacement ABI but skips declaring_class_ synchronization,
+/// because replacement belongs to helper dex and is managed by ART/GC.
+pub(in crate::jsapi::java) fn set_managed_replacement_method(original: u64, replacement: u64, sentinel: u64) {
+    set_replacement_method(original, replacement);
+    unsafe {
+        hook_ffi::hook_art_router_table_set_mode(original, 4);
+        hook_ffi::hook_art_router_table_set_user_data(original, sentinel as *mut std::ffi::c_void);
+    }
+}
+
 /// 注册 original → native replacement sentinel，并让 C 侧 router 直接回调 Rust quick path。
 pub(in crate::jsapi::java) fn set_quick_callback_method(
     original: u64,

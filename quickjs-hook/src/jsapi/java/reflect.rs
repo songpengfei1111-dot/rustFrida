@@ -1139,6 +1139,28 @@ pub(super) fn is_classloader_ready() -> bool {
     REFLECT_IDS.get().map_or(false, |r| !r.app_classloader.is_null())
 }
 
+pub(super) unsafe fn get_app_classloader_local_ref(env: JniEnv) -> *mut std::ffi::c_void {
+    let classloader = {
+        let override_cl = CL_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
+        if override_cl != 0 {
+            override_cl as *mut std::ffi::c_void
+        } else {
+            match REFLECT_IDS.get() {
+                Some(r) if !r.app_classloader.is_null() => r.app_classloader,
+                _ => return std::ptr::null_mut(),
+            }
+        }
+    };
+
+    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+    let local = new_local_ref(env, classloader);
+    if local.is_null() || jni_check_exc(env) {
+        std::ptr::null_mut()
+    } else {
+        local
+    }
+}
+
 /// 主动重新探测 app ClassLoader（spawn resume-first 场景）。
 /// jsinit 时 app 可能尚未初始化，此函数在 Java.ready 安装 hook 后再次尝试，
 /// 通过 ActivityThread.currentActivityThread().getApplication().getClassLoader() 探测。

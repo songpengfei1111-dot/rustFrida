@@ -1,9 +1,10 @@
 use crate::ffi::hook as hook_ffi;
-use crate::jsapi::java::java_lua_fast_api::{LuaFastArg, LuaFastConstructor, LuaFastMethod};
+use crate::jsapi::java::java_lua_fast_api::{LuaFastConstructor, LuaFastMethod};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 const QUICK_PREORIG_RET_REG: usize = 16;
+const FAST_STACK_VALUE_ARGS: usize = 16;
 
 #[derive(Clone, Debug)]
 enum ValueRef {
@@ -908,10 +909,11 @@ unsafe fn read_value(ctx: &hook_ffi::HookContext, rule: &FastRule, value: &Value
                 return 0;
             }
             service_quick_suspend(ctx);
-            let call_args = build_lua_fast_args(ctx, rule, args);
-            let ret = crate::jsapi::java::java_lua_fast_api::invoke_lua_fast_method_art_on_thread(
-                method, ctx.x[19], recv, &call_args,
-            )
+            let ret = with_raw_value_args(ctx, rule, args, |raw_args| {
+                crate::jsapi::java::java_lua_fast_api::invoke_lua_fast_method_raw_on_thread(
+                    method, ctx.x[19], recv, raw_args,
+                )
+            })
             .unwrap_or(0);
             service_quick_suspend(ctx);
             ret
@@ -938,9 +940,18 @@ unsafe fn read_value(ctx: &hook_ffi::HookContext, rule: &FastRule, value: &Value
                     return 0;
                 }
             };
-            let ctor_args = build_lua_fast_args(ctx, rule, args);
+            let mut ctor_raw_stack = [0u64; FAST_STACK_VALUE_ARGS];
+            let ctor_args = match build_raw_value_args(ctx, rule, args, &mut ctor_raw_stack) {
+                Some(v) => v,
+                None => {
+                    FAST_NEW_FAILED.fetch_add(1, Ordering::Relaxed);
+                    let elapsed = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    record_new_latency(elapsed);
+                    return 0;
+                }
+            };
             let obj = crate::jsapi::java::java_lua_fast_api::read_lua_fast_art_root(root).unwrap_or(obj);
-            let ret = match crate::jsapi::java::java_lua_fast_api::invoke_lua_fast_constructor_art_on_thread(
+            let ret = match crate::jsapi::java::java_lua_fast_api::invoke_lua_fast_constructor_raw_on_thread(
                 ctor, thread, obj, &ctor_args,
             ) {
                 Ok(()) => crate::jsapi::java::java_lua_fast_api::read_lua_fast_art_root(root).unwrap_or(obj),
@@ -963,12 +974,33 @@ unsafe fn service_quick_suspend(ctx: &hook_ffi::HookContext) {
 }
 
 #[inline]
-unsafe fn build_lua_fast_args(ctx: &hook_ffi::HookContext, rule: &FastRule, values: &[ValueRef]) -> Vec<LuaFastArg> {
-    let mut out = Vec::with_capacity(values.len());
-    for value in values {
-        out.push(LuaFastArg::Raw(read_value(ctx, rule, value)));
+unsafe fn with_raw_value_args<R>(
+    ctx: &hook_ffi::HookContext,
+    rule: &FastRule,
+    values: &[ValueRef],
+    f: impl FnOnce(&[u64]) -> Result<R, String>,
+) -> Result<R, String> {
+    let mut stack = [0u64; FAST_STACK_VALUE_ARGS];
+    let Some(raw_args) = build_raw_value_args(ctx, rule, values, &mut stack) else {
+        return Err("fastHook argument buffer exceeded fast stack capacity".to_string());
+    };
+    f(raw_args)
+}
+
+#[inline]
+unsafe fn build_raw_value_args<'a>(
+    ctx: &hook_ffi::HookContext,
+    rule: &FastRule,
+    values: &[ValueRef],
+    out: &'a mut [u64; FAST_STACK_VALUE_ARGS],
+) -> Option<&'a [u64]> {
+    if values.len() > out.len() {
+        return None;
     }
-    out
+    for (i, value) in values.iter().enumerate() {
+        out[i] = read_value(ctx, rule, value);
+    }
+    Some(&out[..values.len()])
 }
 
 #[inline]
