@@ -3747,6 +3747,9 @@ impl<'a> DslParser<'a> {
             self.expect_char('.')?;
             parts.push(self.parse_ident()?);
             self.skip_ws();
+            if parts.last().map(|part| part.as_str()) == Some("overload") {
+                return self.parse_js_overload_member_value(parts);
+            }
         }
         if parts.len() < 2 {
             return Err(self.err("expected member access"));
@@ -3826,6 +3829,73 @@ impl<'a> DslParser<'a> {
         }
     }
 
+    fn parse_js_overload_member_value(&mut self, mut parts: Vec<String>) -> Result<DslValue, String> {
+        if parts.len() < 3 || parts.last().map(|part| part.as_str()) != Some("overload") {
+            return Err(self.err("expected member.overload(...)"));
+        }
+        parts.pop();
+        let member_name = parts.pop().unwrap();
+
+        self.expect_char('(')?;
+        self.skip_ws();
+        let mut overload_args = Vec::new();
+        if self.peek() != Some(')') {
+            loop {
+                overload_args.push(self.parse_string_arg()?);
+                if self.peek() != Some(',') {
+                    break;
+                }
+                self.expect_char(',')?;
+                self.skip_ws();
+            }
+        }
+        self.expect_char(')')?;
+        self.skip_ws();
+        self.expect_char('(')?;
+        let args = self.parse_value_arg_list_until_close()?;
+        self.expect_char(')')?;
+
+        if parts.len() == 1 && parse_target_name(&parts[0]).is_some() {
+            let target = parse_target_name(&parts[0]).unwrap();
+            let (class_name, sig) = match overload_args.as_slice() {
+                [sig] => (None, sig.clone()),
+                [class_name, sig] => (Some(class_name.clone()), sig.clone()),
+                _ => {
+                    return Err(self.err(
+                        "instance overload expects overload(\"sig\") or overload(\"Class\", \"sig\")",
+                    ));
+                }
+            };
+            if !sig.starts_with('(') {
+                return Err(self.err("overload requires a method signature"));
+            }
+            Ok(DslValue::Call(DslCallStmt {
+                kind: DslCallKind::Virtual,
+                target: Some(target),
+                class_name,
+                method_name: member_name,
+                sig,
+                args,
+            }))
+        } else {
+            if overload_args.len() != 1 {
+                return Err(self.err("static overload expects overload(\"sig\")"));
+            }
+            let sig = overload_args[0].clone();
+            if !sig.starts_with('(') {
+                return Err(self.err("overload requires a method signature"));
+            }
+            Ok(DslValue::Call(DslCallStmt {
+                kind: DslCallKind::Static,
+                target: None,
+                class_name: Some(parts.join(".")),
+                method_name: member_name,
+                sig,
+                args,
+            }))
+        }
+    }
+
     fn parse_js_condition(&mut self) -> Result<DslCondition, String> {
         let left = self.parse_value_arg()?;
         self.skip_ws();
@@ -3868,6 +3938,23 @@ impl<'a> DslParser<'a> {
             };
         }
         Ok(DslCondition::Cmp { op, left, right })
+    }
+
+    fn parse_value_arg_list_until_close(&mut self) -> Result<Vec<DslValue>, String> {
+        let mut args = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(')') {
+                break;
+            }
+            args.push(self.parse_value_arg()?);
+            self.skip_ws();
+            if self.peek() != Some(',') {
+                break;
+            }
+            self.expect_char(',')?;
+        }
+        Ok(args)
     }
 
     fn parse_js_cmp_op(&mut self) -> Result<IfCmpOp, String> {
