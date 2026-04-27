@@ -1389,25 +1389,35 @@ fn emit_assign(
 fn emit_let_orig(
     ir: &mut DexIrBuilder,
     name: &str,
-    type_name: &str,
+    type_name: Option<&str>,
     args: &DslOrigArgs,
     emit_ctx: &mut EmitContext<'_>,
 ) -> Result<(), String> {
     if emit_ctx.return_type == "V" {
         return Err("void orig() cannot be assigned to a local".to_string());
     }
-    let descriptor = java_class_to_descriptor_or_primitive(type_name)?;
-    if !value_descriptor_assignable_to(emit_ctx.return_type, &descriptor) {
-        return Err(format!(
-            "orig() return type {} cannot be assigned to {}",
-            emit_ctx.return_type, descriptor
-        ));
-    }
     let slot = emit_ctx
         .layout
         .local_regs
         .get(name)
         .ok_or_else(|| format!("local '{}' is not allocated", name))?;
+    let descriptor = if let Some(type_name) = type_name {
+        java_class_to_descriptor_or_primitive(type_name)?
+    } else {
+        slot.descriptor.clone()
+    };
+    if slot.descriptor != descriptor {
+        return Err(format!(
+            "local '{}' type mismatch: declared {}, emitted {}",
+            name, slot.descriptor, descriptor
+        ));
+    }
+    if !value_descriptor_assignable_to(emit_ctx.return_type, &slot.descriptor) {
+        return Err(format!(
+            "orig() return type {} cannot be assigned to {}",
+            emit_ctx.return_type, slot.descriptor
+        ));
+    }
     emit_orig_invoke(ir, args, emit_ctx)?;
     emit_move_result_value(ir, emit_ctx.return_type, slot.reg)?;
     Ok(())
@@ -2377,26 +2387,18 @@ struct ReturnFlow {
 }
 
 fn analyze_return_flow(stmts: &[DslStmt]) -> ReturnFlow {
+    let mut has_non_orig_return = false;
     for stmt in stmts {
-        match stmt {
-            DslStmt::Block(stmts) => {
-                let flow = analyze_return_flow(stmts);
-                if flow.has_non_orig_return || !flow.falls_through {
-                    return flow;
-                }
-            }
-            DslStmt::ReturnOrig { .. } => {
-                return ReturnFlow {
-                    falls_through: false,
-                    has_non_orig_return: false,
-                };
-            }
-            DslStmt::ReturnValue { .. } => {
-                return ReturnFlow {
-                    falls_through: false,
-                    has_non_orig_return: true,
-                };
-            }
+        let stmt_flow = match stmt {
+            DslStmt::Block(stmts) => analyze_return_flow(stmts),
+            DslStmt::ReturnOrig { .. } => ReturnFlow {
+                falls_through: false,
+                has_non_orig_return: false,
+            },
+            DslStmt::ReturnValue { .. } => ReturnFlow {
+                falls_through: false,
+                has_non_orig_return: true,
+            },
             DslStmt::IfNull {
                 then_stmts, else_stmts, ..
             }
@@ -2411,17 +2413,9 @@ fn analyze_return_flow(stmts: &[DslStmt]) -> ReturnFlow {
             } => {
                 let then_flow = analyze_return_flow(then_stmts);
                 let else_flow = analyze_return_flow(else_stmts);
-                if then_flow.has_non_orig_return || else_flow.has_non_orig_return {
-                    return ReturnFlow {
-                        falls_through: then_flow.falls_through || else_flow.falls_through,
-                        has_non_orig_return: true,
-                    };
-                }
-                if !then_flow.falls_through && !else_flow.falls_through {
-                    return ReturnFlow {
-                        falls_through: false,
-                        has_non_orig_return: false,
-                    };
+                ReturnFlow {
+                    falls_through: then_flow.falls_through || else_flow.falls_through,
+                    has_non_orig_return: then_flow.has_non_orig_return || else_flow.has_non_orig_return,
                 }
             }
             DslStmt::Switch {
@@ -2439,25 +2433,27 @@ fn analyze_return_flow(stmts: &[DslStmt]) -> ReturnFlow {
                     falls_through |= flow.falls_through;
                     has_non_orig_return |= flow.has_non_orig_return;
                 }
-                if has_non_orig_return {
-                    return ReturnFlow {
-                        falls_through,
-                        has_non_orig_return: true,
-                    };
-                }
-                if !falls_through {
-                    return ReturnFlow {
-                        falls_through: false,
-                        has_non_orig_return: false,
-                    };
+                ReturnFlow {
+                    falls_through,
+                    has_non_orig_return,
                 }
             }
-            _ => {}
+            _ => ReturnFlow {
+                falls_through: true,
+                has_non_orig_return: false,
+            },
+        };
+        has_non_orig_return |= stmt_flow.has_non_orig_return;
+        if !stmt_flow.falls_through {
+            return ReturnFlow {
+                falls_through: false,
+                has_non_orig_return,
+            };
         }
     }
     ReturnFlow {
         falls_through: true,
-        has_non_orig_return: false,
+        has_non_orig_return,
     }
 }
 
@@ -2744,7 +2740,7 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             Ok(false)
         }
         DslStmt::LetOrig { name, type_name, args } => {
-            emit_let_orig(ir, name, type_name, args, emit_ctx)?;
+            emit_let_orig(ir, name, type_name.as_deref(), args, emit_ctx)?;
             Ok(false)
         }
         DslStmt::New {

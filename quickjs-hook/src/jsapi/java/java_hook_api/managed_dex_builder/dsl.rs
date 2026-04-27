@@ -18,7 +18,7 @@ pub(super) enum DslStmt {
     },
     LetOrig {
         name: String,
-        type_name: String,
+        type_name: Option<String>,
         args: DslOrigArgs,
     },
     New {
@@ -496,9 +496,6 @@ impl<'a> DslParser<'a> {
         self.expect_char('=')?;
         self.skip_ws();
         if self.peek_ident("orig") {
-            let Some(type_name) = type_name else {
-                return Err(self.err("let x = orig(...) requires an explicit type"));
-            };
             self.expect_ident("orig")?;
             let args = self.parse_orig_args()?;
             self.skip_ws();

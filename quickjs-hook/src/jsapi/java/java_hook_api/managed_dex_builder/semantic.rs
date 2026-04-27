@@ -15,6 +15,7 @@ struct DslSemanticContext {
     env: JniEnv,
     this_descriptor: Option<String>,
     arg_descriptors: Vec<String>,
+    target_return_type: String,
     local_descriptors: BTreeMap<String, String>,
     target_narrow_types: BTreeMap<DslTargetKey, Option<String>>,
 }
@@ -98,11 +99,18 @@ fn condition_facts_when_false(condition: &DslCondition) -> Vec<(DslTargetKey, Op
 }
 
 impl DslSemanticContext {
-    fn new(env: JniEnv, is_static: bool, target_type: String, target_params: Vec<String>) -> Self {
+    fn new(
+        env: JniEnv,
+        is_static: bool,
+        target_type: String,
+        target_params: Vec<String>,
+        target_return_type: String,
+    ) -> Self {
         Self {
             env,
             this_descriptor: if is_static { None } else { Some(target_type) },
             arg_descriptors: target_params,
+            target_return_type,
             local_descriptors: BTreeMap::new(),
             target_narrow_types: BTreeMap::new(),
         }
@@ -594,7 +602,21 @@ impl DslSemanticContext {
                 }
             }
             DslStmt::LetOrig { name, type_name, args } => {
-                let descriptor = java_class_to_descriptor_or_primitive(type_name)?;
+                if self.target_return_type == "V" {
+                    return Err("void orig() cannot be assigned to a local".to_string());
+                }
+                let descriptor = if let Some(type_name) = type_name {
+                    let descriptor = java_class_to_descriptor_or_primitive(type_name)?;
+                    if !value_descriptor_assignable_to(&self.target_return_type, &descriptor) {
+                        return Err(format!(
+                            "orig() return type {} cannot be assigned to {}",
+                            self.target_return_type, descriptor
+                        ));
+                    }
+                    descriptor
+                } else {
+                    self.target_return_type.clone()
+                };
                 self.validate_orig_args(args)?;
                 self.local_descriptors.entry(name.clone()).or_insert(descriptor);
             }
@@ -730,8 +752,9 @@ pub(super) fn validate_semantics(
     is_static: bool,
     target_type: String,
     target_params: Vec<String>,
+    target_return_type: String,
 ) -> Result<BTreeMap<String, String>, String> {
-    let mut ctx = DslSemanticContext::new(env, is_static, target_type, target_params);
+    let mut ctx = DslSemanticContext::new(env, is_static, target_type, target_params, target_return_type);
     ctx.validate_stmts(&program.stmts)?;
     Ok(ctx.local_descriptors)
 }

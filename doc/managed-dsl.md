@@ -23,10 +23,13 @@ Java.ready(function () {
     methodName: "put",
     signature: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
     dsl:
-      "let n: int = this.size.overload()();" +
+      "let n: int = this.size();" +
       "let plus: int = n + 1;" +
-      "let sb: java.lang.StringBuilder = java.lang.StringBuilder.$new(\"java.lang.String\", \"seed\");" +
-      "sb.append.overload(\"java.lang.Object\")(arg0);" +
+      "let sb: java.lang.StringBuilder = java.lang.StringBuilder.$new(\"seed\");" +
+      "if (arg0 instanceof java.lang.String) {" +
+      "  let keyLen: int = (arg0 as java.lang.String).length();" +
+      "  sb.append(arg0);" +
+      "}" +
       "new int[](3);" +
       "let a: int[] = last;" +
       "a[0] = plus;" +
@@ -76,11 +79,17 @@ backup=0
 ### Locals
 
 ```js
-"let n: int = this.size.overload()();" +
-"let plus: int = n + 1;"
+"let n = this.size();" +
+"let plus = n + 1;"
 ```
 
-Local declarations require an explicit type.
+Local declarations can infer their type from the expression descriptor. Use an
+explicit type when the expression is ambiguous or intentionally widened:
+
+```js
+"let obj: java.lang.Object = arg0;" +
+"let s = arg0 as java.lang.String;"
+```
 
 ### Arguments And Built-In Targets
 
@@ -98,13 +107,13 @@ the parser, but the JS-like names above are preferred.
 ### Constructors
 
 ```js
-"new java.lang.StringBuilder(\"java.lang.String\", \"seed\");"
+"new java.lang.StringBuilder(\"seed\");"
 ```
 
 Constructor expression:
 
 ```js
-"let sb: java.lang.StringBuilder = java.lang.StringBuilder.$new(\"java.lang.String\", \"seed\");"
+"let sb: java.lang.StringBuilder = java.lang.StringBuilder.$new(\"seed\");"
 ```
 
 For no-arg constructors:
@@ -127,24 +136,31 @@ Instance call with inferred receiver:
 
 ```js
 "let sb: java.lang.StringBuilder = last;" +
-"sb.append.overload(\"java.lang.Object\")(arg0);"
+"sb.append(arg0);"
 ```
 
 Instance call on `this`:
 
 ```js
-"let n: int = this.size.overload()();"
+"let n: int = this.size();"
 ```
 
 Static call:
 
 ```js
-"let value: int = java.lang.Integer.parseInt.overload(\"java.lang.String\")(\"123\");"
+"let value: int = java.lang.Integer.parseInt(\"123\");"
 ```
 
-`overload(...)` accepts Java parameter type names. The return type is resolved
-from reflection by class + method name + parameter list, because Java return
-types do not participate in overload selection.
+Direct calls infer the overload from the receiver type and argument descriptors.
+Interface receivers emit `invoke-interface`; class receivers emit virtual,
+direct, or static invoke as appropriate. If overload resolution is ambiguous or
+no overload matches, the compiler reports a compile-time error and the script
+should use explicit `overload(...)`.
+
+`overload(...)` is still available for disambiguation and accepts Java parameter
+type names. The return type is resolved from reflection by class + method name +
+parameter list, because Java return types do not participate in overload
+selection.
 
 Full JNI signatures are still accepted when reflection cannot resolve a method:
 
@@ -167,6 +183,13 @@ Call the original method with explicit arguments:
 ```
 
 Store the original result before running more DSL logic:
+
+```js
+"let old = orig(arg0, arg1);" +
+"return old;"
+```
+
+You can still write an explicit type if you want to widen the original return:
 
 ```js
 "let old: java.lang.Object = orig(arg0, arg1);" +
@@ -234,14 +257,26 @@ boolean calls and fields:
 Object method calls follow normal Java null semantics. Add null guards before
 calling methods on arguments from natural app traffic.
 
-`instanceof` is supported:
+`instanceof` is supported and narrows the guarded target in the true branch:
 
 ```js
 "if (arg0 instanceof java.lang.String) {" +
-"  return orig();" +
+"  let n: int = arg0.length();" +
+"  return orig(arg0, arg1);" +
 "} else {" +
-"  return orig();" +
+"  return orig(arg0, arg1);" +
 "}"
+```
+
+The same narrowing is available inside compound expressions and ternary
+branches:
+
+```js
+"if (arg0 instanceof java.lang.String && arg0.length() > 0) {" +
+"  let n: int = (arg0 instanceof java.lang.String ? arg0.length() : 0);" +
+"  return orig(arg0, arg1);" +
+"}" +
+"return orig(arg0, arg1);"
 ```
 
 Compound conditions support JS-like `&&`, `||`, `!`, and parentheses:
@@ -267,6 +302,22 @@ Integer `switch` is supported with explicit blocks and automatic break:
 Dense integer cases compile to dex `packed-switch`; sparse cases compile to
 dex `sparse-switch`.
 
+### Casts
+
+Use `as` for explicit object casts when the compiler cannot infer the precise
+receiver type or when the code reads better with an explicit type:
+
+```js
+"if (arg0 instanceof java.lang.String) {" +
+"  let n: int = (arg0 as java.lang.String).length();" +
+"  return orig(arg0, arg1);" +
+"}" +
+"return orig(arg0, arg1);"
+```
+
+The cast compiles to dex `check-cast`; it does not cross the JS/Lua runtime
+boundary.
+
 ### Returns
 
 High-frequency orig path:
@@ -282,10 +333,9 @@ Orig result path:
 "return old;"
 ```
 
-`let x = orig(...)` is intentionally restricted: it must appear once as the
-first top-level statement, and it cannot be mixed with `return orig(...)`. This
-keeps the per-thread orig bypass consumed exactly once before any user DSL logic
-runs.
+`let x = orig(...)` is intentionally restricted: it must appear once as the first
+top-level statement, and it cannot be mixed with `return orig(...)`. This keeps
+the per-thread orig bypass consumed exactly once before any user DSL logic runs.
 
 Direct value returns are supported only for DSL programs that do not use
 `orig()` or `orig(...)`:
@@ -300,7 +350,8 @@ Direct value returns are supported only for DSL programs that do not use
 - `return orig(...)` cannot be mixed with `return null`, `return value`, or
   fall-through return paths.
 - `let x = orig(...)` must be the first top-level statement and cannot be nested.
-- Local variable type inference is not supported; use `let name: Type = value`.
+- Local variable type inference uses the static descriptor of the expression.
+  Use `let name: Type = value` when inference is impossible, for example `null`.
 - `switch` supports integer case constants only. Case bodies must use `{ ... }`,
   and fallthrough/break are not part of the DSL.
 - Loops are not part of the JS-like managed DSL.
@@ -310,6 +361,33 @@ Direct value returns are supported only for DSL programs that do not use
   Avoid JS/Lua callbacks on hot methods.
 - Reflection-style Java APIs from JS/Lua are not the high-frequency path. Use
   managed DSL operations that compile into dex bytecode.
+
+## JD HashMap High-Frequency Template
+
+This is the current preferred smoke test for hot Java traffic. It exercises
+direct overload inference, `instanceof` narrowing, `as` cast, and explicit
+`orig(arg0, arg1)` while staying in generated dex code:
+
+```js
+Java.ready(function () {
+  console.log("[managed-dsl] install HashMap.put smoke test");
+  Java._resetArtRouteStats();
+  Java.managedHookDsl({
+    className: "java.util.HashMap",
+    methodName: "put",
+    signature: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    dsl:
+      "if (arg0 instanceof java.lang.String && arg0.length() >= 0) {" +
+      "  let n: int = (arg0 as java.lang.String).length();" +
+      "  return orig(arg0, arg1);" +
+      "}" +
+      "return orig(arg0, arg1);"
+  });
+});
+```
+
+Run it against JD natural startup traffic and require at least 150k managed
+direct hits before calling the result stable.
 
 ## Device Validation
 

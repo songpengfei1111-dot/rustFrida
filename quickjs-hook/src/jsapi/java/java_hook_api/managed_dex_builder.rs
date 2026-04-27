@@ -335,7 +335,14 @@ pub(super) unsafe fn build_managed_dsl_dex(
     let target_type = java_class_to_descriptor(target_class_name)?;
     let object_type = "Ljava/lang/Object;".to_string();
     let (target_params, return_type) = parse_method_signature(target_sig)?;
-    let local_descriptors = validate_semantics(env, &program, is_static, target_type.clone(), target_params.clone())?;
+    let local_descriptors = validate_semantics(
+        env,
+        &program,
+        is_static,
+        target_type.clone(),
+        target_params.clone(),
+        return_type.clone(),
+    )?;
     let mut helper_params = Vec::new();
     if !is_static {
         helper_params.push(target_type.clone());
