@@ -1,12 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::super::jni_core::JniEnv;
+use super::super::reflect::{enumerate_methods, enumerate_methods_declared_only};
+
 pub(super) const ACC_PUBLIC: u32 = 0x0001;
 pub(super) const ACC_PRIVATE: u32 = 0x0002;
 pub(super) const ACC_PROTECTED: u32 = 0x0004;
 pub(super) const ACC_STATIC: u32 = 0x0008;
 pub(super) const ACC_FINAL: u32 = 0x0010;
+pub(super) const ACC_BRIDGE: u32 = 0x0040;
 pub(super) const ACC_VOLATILE: u32 = 0x0040;
 pub(super) const ACC_NATIVE: u32 = 0x0100;
+pub(super) const ACC_SYNTHETIC: u32 = 0x1000;
 pub(super) const ACC_CONSTRUCTOR: u32 = 0x0001_0000;
 pub(super) const ACC_DECLARED_SYNCHRONIZED: u32 = 0x0002_0000;
 
@@ -1480,6 +1485,48 @@ pub(super) fn parse_method_signature(sig: &str) -> Result<(Vec<String>, String),
     Ok((params, sig[ret_start..pos].to_string()))
 }
 
+fn parse_method_params_signature(sig: &str) -> Result<Vec<String>, String> {
+    let bytes = sig.as_bytes();
+    if bytes.first().copied() != Some(b'(') {
+        return Err(format!("invalid method parameter signature '{}': missing '('", sig));
+    }
+
+    let mut params = Vec::new();
+    let mut pos = 1usize;
+    while pos < bytes.len() && bytes[pos] != b')' {
+        let start = pos;
+        parse_descriptor_at(sig, &mut pos, false)?;
+        params.push(sig[start..pos].to_string());
+    }
+    if pos >= bytes.len() || bytes[pos] != b')' {
+        return Err(format!("invalid method parameter signature '{}': missing ')'", sig));
+    }
+    pos += 1;
+    if pos != bytes.len() {
+        return Err(format!(
+            "invalid method parameter signature '{}': trailing input",
+            sig
+        ));
+    }
+    Ok(params)
+}
+
+fn parse_call_params(sig: &str) -> Result<Vec<String>, String> {
+    match parse_method_signature(sig) {
+        Ok((params, _)) => Ok(params),
+        Err(_) => parse_method_params_signature(sig),
+    }
+}
+
+fn build_params_sig(params: &[String]) -> String {
+    let mut sig = String::from("(");
+    for param in params {
+        sig.push_str(param);
+    }
+    sig.push(')');
+    sig
+}
+
 fn parse_descriptor_at(sig: &str, pos: &mut usize, allow_void: bool) -> Result<(), String> {
     let bytes = sig.as_bytes();
     if *pos >= bytes.len() {
@@ -1589,14 +1636,16 @@ struct LocalSlot {
 }
 
 struct DslBuildContext {
+    env: JniEnv,
     generated_type: String,
     string_literals: Vec<GeneratedStringLiteral>,
     range_scratch_base: u16,
 }
 
 impl DslBuildContext {
-    fn new(generated_type: String, range_scratch_base: u16) -> Self {
+    fn new(env: JniEnv, generated_type: String, range_scratch_base: u16) -> Self {
         Self {
+            env,
             generated_type,
             string_literals: Vec::new(),
             range_scratch_base,
@@ -1775,11 +1824,11 @@ fn emit_call_value(
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<u8, String> {
     let class_type = resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref(), layout)?;
-    let (params, return_type) = parse_method_signature(&stmt.sig)?;
+    let (params, return_type, full_sig) = resolve_call_proto(dsl_ctx.env, stmt, &class_type)?;
     if return_type == "V" {
         return Err(format!(
             "{}.{}{} returns void and cannot be used as a value",
-            stmt.class_label(), stmt.method_name, stmt.sig
+            stmt.class_label(), stmt.method_name, full_sig
         ));
     }
     if !value_descriptor_assignable_to(&return_type, expected_type) {
@@ -1793,7 +1842,7 @@ fn emit_call_value(
             "{}.{}{} expects {} explicit args, got {}",
             stmt.class_label(),
             stmt.method_name,
-            stmt.sig,
+            full_sig,
             params.len(),
             stmt.args.len()
         ));
@@ -1973,7 +2022,8 @@ fn infer_value_descriptor(value: &DslValue, layout: &HelperParamLayout) -> Resul
         }
         DslValue::Null => Ok(None),
         DslValue::Call(stmt) => {
-            let (_, return_type) = parse_method_signature(&stmt.sig)?;
+            let (_, return_type) = parse_method_signature(&stmt.sig)
+                .map_err(|_| "call return type cannot be inferred in this context".to_string())?;
             if return_type == "V" {
                 Ok(None)
             } else {
@@ -2096,6 +2146,83 @@ fn resolve_member_class_type(
         ));
     }
     Ok(desc)
+}
+
+fn descriptor_to_java_class_name(desc: &str) -> Result<String, String> {
+    let Some(class_desc) = desc.strip_prefix('L').and_then(|value| value.strip_suffix(';')) else {
+        return Err(format!("method overload resolution requires object class, got {}", desc));
+    };
+    Ok(class_desc.replace('/', "."))
+}
+
+fn resolve_call_proto(
+    env: JniEnv,
+    stmt: &DslCallStmt,
+    class_type: &str,
+) -> Result<(Vec<String>, String, String), String> {
+    if let Ok((params, return_type)) = parse_method_signature(&stmt.sig) {
+        return Ok((params, return_type, stmt.sig.clone()));
+    }
+
+    let params = parse_method_params_signature(&stmt.sig)?;
+    let params_sig = build_params_sig(&params);
+    let class_name = descriptor_to_java_class_name(class_type)?;
+    let is_static = matches!(stmt.kind, DslCallKind::Static);
+    let collect_matches = |declared_only: bool, include_synthetic: bool| -> Result<BTreeSet<String>, String> {
+        let methods = unsafe {
+            if declared_only {
+                enumerate_methods_declared_only(env, &class_name)
+            } else {
+                enumerate_methods(env, &class_name)
+            }
+        }?;
+        let mut matches = BTreeSet::new();
+        for method in methods {
+            if method.name != stmt.method_name || method.is_static != is_static {
+                continue;
+            }
+            if !include_synthetic
+                && (method.modifiers & (ACC_BRIDGE as i32 | ACC_SYNTHETIC as i32)) != 0
+            {
+                continue;
+            }
+            let Ok((method_params, _)) = parse_method_signature(&method.sig) else {
+                continue;
+            };
+            if build_params_sig(&method_params) == params_sig {
+                matches.insert(method.sig);
+            }
+        }
+        Ok(matches)
+    };
+
+    let declared_matches = collect_matches(true, false)?;
+    let matches = if declared_matches.is_empty() {
+        let inherited_matches = collect_matches(false, false)?;
+        if inherited_matches.is_empty() {
+            collect_matches(false, true)?
+        } else {
+            inherited_matches
+        }
+    } else {
+        declared_matches
+    };
+
+    match matches.len() {
+        1 => {
+            let full_sig = matches.into_iter().next().unwrap();
+            let (params, return_type) = parse_method_signature(&full_sig)?;
+            Ok((params, return_type, full_sig))
+        }
+        0 => Err(format!(
+            "method not found for {}.{}{}; use a full JNI signature if reflection cannot resolve it",
+            class_name, stmt.method_name, params_sig
+        )),
+        _ => Err(format!(
+            "ambiguous method return for {}.{}{}; use overload(\"full JNI signature\")",
+            class_name, stmt.method_name, params_sig
+        )),
+    }
 }
 
 fn emit_field_read(
@@ -2502,13 +2629,13 @@ fn emit_call(
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<MethodRef, String> {
     let class_type = resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref(), layout)?;
-    let (params, return_type) = parse_method_signature(&stmt.sig)?;
+    let (params, return_type, full_sig) = resolve_call_proto(dsl_ctx.env, stmt, &class_type)?;
     if params.len() != stmt.args.len() {
         return Err(format!(
             "{}.{}{} expects {} explicit args, got {}",
             stmt.class_label(),
             stmt.method_name,
-            stmt.sig,
+            full_sig,
             params.len(),
             stmt.args.len()
         ));
@@ -2594,7 +2721,7 @@ fn statements_max_invoke_words(stmts: &[DslStmt]) -> Result<u16, String> {
             }
             DslStmt::NewArray { size, .. } => value_max_invoke_words(size)?,
             DslStmt::Call(stmt) => {
-                let (params, _) = parse_method_signature(&stmt.sig)?;
+                let params = parse_call_params(&stmt.sig)?;
                 let mut words = invoke_arg_words(stmt.target.is_some(), &params)?;
                 for arg in &stmt.args {
                     words = words.max(value_max_invoke_words(arg)?);
@@ -2655,7 +2782,7 @@ fn statements_max_invoke_words(stmts: &[DslStmt]) -> Result<u16, String> {
 fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
     match value {
         DslValue::Call(stmt) => {
-            let (params, _) = parse_method_signature(&stmt.sig)?;
+            let params = parse_call_params(&stmt.sig)?;
             let mut words = invoke_arg_words(stmt.target.is_some(), &params)?;
             for arg in &stmt.args {
                 words = words.max(value_max_invoke_words(arg)?);
@@ -3010,7 +3137,8 @@ fn emit_statements(ir: &mut DexIrBuilder, stmts: &[DslStmt], emit_ctx: &mut Emit
     Ok(false)
 }
 
-pub(super) fn build_managed_dsl_dex(
+pub(super) unsafe fn build_managed_dsl_dex(
+    env: JniEnv,
     class_id: u64,
     target_class_name: &str,
     target_method_name: &str,
@@ -3061,7 +3189,7 @@ pub(super) fn build_managed_dsl_dex(
     let generated_type = format!("Lrustfrida/DynManagedHook{};", class_id);
     let generated_class_name = format!("rustfrida.DynManagedHook{}", class_id);
     let sink = FieldRef::new(generated_type.clone(), object_type.clone(), "sink");
-    let mut dsl_ctx = DslBuildContext::new(generated_type.clone(), BASE_LOCAL_REG_COUNT);
+    let mut dsl_ctx = DslBuildContext::new(env, generated_type.clone(), BASE_LOCAL_REG_COUNT);
     let target = MethodRef::new(
         target_type.clone(),
         target_method_name.to_string(),
@@ -3857,40 +3985,57 @@ impl<'a> DslParser<'a> {
 
         if parts.len() == 1 && parse_target_name(&parts[0]).is_some() {
             let target = parse_target_name(&parts[0]).unwrap();
-            let (class_name, sig) = match overload_args.as_slice() {
-                [sig] => (None, sig.clone()),
-                [class_name, sig] => (Some(class_name.clone()), sig.clone()),
-                _ => {
-                    return Err(self.err(
-                        "instance overload expects overload(\"sig\") or overload(\"Class\", \"sig\")",
-                    ));
+            let (class_name, params) = if overload_args.first().map(|arg| arg.starts_with('(')).unwrap_or(false) {
+                (None, overload_args[0].clone())
+            } else if overload_args.len() >= 2
+                && overload_args[1].starts_with('(')
+            {
+                (Some(overload_args[0].clone()), overload_args[1].clone())
+            } else {
+                let first_is_explicit_class = matches!(target, DslTarget::Last | DslTarget::Result)
+                    && overload_args.len() >= 2
+                    && overload_args[0].contains('.');
+                if first_is_explicit_class {
+                    let param_types = overload_args[1..]
+                        .iter()
+                        .map(|arg| java_class_to_descriptor_or_primitive(arg))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (Some(overload_args[0].clone()), build_params_sig(&param_types))
+                } else {
+                    let param_types = overload_args
+                        .iter()
+                        .map(|arg| java_class_to_descriptor_or_primitive(arg))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (None, build_params_sig(&param_types))
                 }
             };
-            if !sig.starts_with('(') {
-                return Err(self.err("overload requires a method signature"));
-            }
             Ok(DslValue::Call(DslCallStmt {
                 kind: DslCallKind::Virtual,
                 target: Some(target),
                 class_name,
                 method_name: member_name,
-                sig,
+                sig: params,
                 args,
             }))
         } else {
-            if overload_args.len() != 1 {
-                return Err(self.err("static overload expects overload(\"sig\")"));
-            }
-            let sig = overload_args[0].clone();
-            if !sig.starts_with('(') {
-                return Err(self.err("overload requires a method signature"));
-            }
+            let params = if overload_args.first().map(|arg| arg.starts_with('(')).unwrap_or(false) {
+                if overload_args.len() != 1 {
+                    return Err(self.err("static full-signature overload expects overload(\"sig\")"));
+                }
+                overload_args[0].clone()
+            } else {
+                let param_types = overload_args
+                    .iter()
+                    .map(|arg| java_class_to_descriptor_or_primitive(arg))
+                    .collect::<Result<Vec<_>, _>>()?;
+                build_params_sig(&param_types)
+            };
             Ok(DslValue::Call(DslCallStmt {
                 kind: DslCallKind::Static,
                 target: None,
                 class_name: Some(parts.join(".")),
                 method_name: member_name,
-                sig,
+                sig: params,
                 args,
             }))
         }

@@ -1448,6 +1448,7 @@ pub(crate) struct MethodInfo {
     pub(crate) name: String,
     pub(crate) sig: String,
     pub(crate) is_static: bool,
+    pub(crate) modifiers: i32,
 }
 
 /// Convert Java type name (from Class.getName()) to JNI type descriptor.
@@ -1629,7 +1630,12 @@ unsafe fn enumerate_methods_inner(
 
             let key = format!("{}|{}|{}", name, sig, is_static as u8);
             if seen.insert(key) {
-                results.push(MethodInfo { name, sig, is_static });
+                results.push(MethodInfo {
+                    name,
+                    sig,
+                    is_static,
+                    modifiers,
+                });
             }
         }
     };
@@ -1702,6 +1708,7 @@ unsafe fn enumerate_methods_inner(
                         name: "<init>".to_string(),
                         sig,
                         is_static: false,
+                        modifiers: 0,
                     });
                 }
             }

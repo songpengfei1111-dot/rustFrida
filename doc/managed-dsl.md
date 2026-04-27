@@ -23,10 +23,11 @@ Java.ready(function () {
     methodName: "put",
     signature: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
     dsl:
-      "let n: int = this.size.overload(\"()I\")();" +
+      "let n: int = this.size.overload()();" +
       "let plus: int = n + 1;" +
       "new java.lang.StringBuilder(\"(Ljava/lang/String;)V\", \"seed\");" +
-      "last.append.overload(\"java.lang.StringBuilder\", \"(Ljava/lang/Object;)Ljava/lang/StringBuilder;\")(arg0);" +
+      "let sb: java.lang.StringBuilder = last;" +
+      "sb.append.overload(\"java.lang.Object\")(arg0);" +
       "new int[](3);" +
       "let a: int[] = last;" +
       "a[0] = plus;" +
@@ -70,7 +71,7 @@ backup=0
 ### Locals
 
 ```js
-"let n: int = this.size.overload(\"()I\")();" +
+"let n: int = this.size.overload()();" +
 "let plus: int = n + 1;"
 ```
 
@@ -108,23 +109,27 @@ The new object is stored in `last`.
 Instance call with inferred receiver:
 
 ```js
-"last.append.overload(\"java.lang.StringBuilder\", \"(Ljava/lang/Object;)Ljava/lang/StringBuilder;\")(arg0);"
+"let sb: java.lang.StringBuilder = last;" +
+"sb.append.overload(\"java.lang.Object\")(arg0);"
 ```
 
 Instance call on `this`:
 
 ```js
-"let n: int = this.size.overload(\"()I\")();"
+"let n: int = this.size.overload()();"
 ```
 
 Static call:
 
 ```js
-"let value: int = java.lang.Integer.parseInt.overload(\"(Ljava/lang/String;)I\")(\"123\");"
+"let value: int = java.lang.Integer.parseInt.overload(\"java.lang.String\")(\"123\");"
 ```
 
-When the receiver type cannot be inferred, pass the class name as the first
-`overload` argument:
+`overload(...)` accepts Java parameter type names. The return type is resolved
+from reflection by class + method name + parameter list, because Java return
+types do not participate in overload selection.
+
+Full JNI signatures are still accepted when reflection cannot resolve a method:
 
 ```js
 "last.append.overload(\"java.lang.StringBuilder\", \"(Ljava/lang/Object;)Ljava/lang/StringBuilder;\")(arg0);"

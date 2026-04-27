@@ -52,10 +52,12 @@ pub(super) unsafe extern "C" fn js_java_methods(
         let name_val = JSValue::string(ctx, &m.name);
         let sig_val = JSValue::string(ctx, &m.sig);
         let static_val = JSValue::bool(m.is_static);
+        let modifiers_val = JSValue::int(m.modifiers);
 
         obj_val.set_property(ctx, "name", name_val);
         obj_val.set_property(ctx, "sig", sig_val);
         obj_val.set_property(ctx, "static", static_val);
+        obj_val.set_property(ctx, "modifiers", modifiers_val);
 
         ffi::JS_SetPropertyUint32(ctx, arr, i as u32, obj);
     }

@@ -398,7 +398,7 @@ unsafe fn install_managed_dsl_inner(class_name: &str, method_name: &str, sig: &s
     let env = ensure_jni_initialized()?;
     let (_, is_static) = resolve_art_method(env, class_name, method_name, sig, false)?;
     let class_id = DYNAMIC_MANAGED_CLASS_ID.fetch_add(1, Ordering::Relaxed);
-    let generated = build_managed_dsl_dex(class_id, class_name, method_name, sig, is_static, dsl)?;
+    let generated = build_managed_dsl_dex(env, class_id, class_name, method_name, sig, is_static, dsl)?;
     output_message(&format!(
         "[managedHook] generated generic DSL dex class={} target={}.{}{} static={} dexSize={}",
         generated.class_name,
