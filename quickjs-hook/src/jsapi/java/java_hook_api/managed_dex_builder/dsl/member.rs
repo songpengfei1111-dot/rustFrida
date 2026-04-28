@@ -43,61 +43,10 @@ impl<'a> DslParser<'a> {
         }
 
         if self.peek() != Some('(') {
-            if call_kind == DslCallKind::Interface {
-                return Err(self.err("interface field access is not supported"));
-            }
-            return Ok(DslValue::FieldGet {
-                stmt: Box::new(DslFieldStmt {
-                    target: None,
-                    receiver: Some(Box::new(receiver)),
-                    class_name: None,
-                    field_name: member_name,
-                    type_name: String::new(),
-                    value: None,
-                }),
-                is_static: false,
-            });
+            return self.build_receiver_member_field(receiver, member_name, call_kind, String::new());
         }
 
-        self.expect_char('(')?;
-        match self.parse_member_call_args(true, false)? {
-            ParsedCallArgs::Direct(args) => Ok(DslValue::Call(DslCallStmt {
-                kind: call_kind,
-                target: None,
-                receiver: Some(Box::new(receiver)),
-                null_safe,
-                class_name: None,
-                method_name: member_name,
-                sig: String::new(),
-                args,
-            })),
-            ParsedCallArgs::LegacyCall { class_name, sig, args } => Ok(DslValue::Call(DslCallStmt {
-                kind: call_kind,
-                target: None,
-                receiver: Some(Box::new(receiver)),
-                null_safe,
-                class_name,
-                method_name: member_name,
-                sig,
-                args,
-            })),
-            ParsedCallArgs::Field { type_name, .. } => {
-                if call_kind == DslCallKind::Interface {
-                    return Err(self.err("interface field access is not supported"));
-                }
-                Ok(DslValue::FieldGet {
-                    stmt: Box::new(DslFieldStmt {
-                        target: None,
-                        receiver: Some(Box::new(receiver)),
-                        class_name: None,
-                        field_name: member_name,
-                        type_name,
-                        value: None,
-                    }),
-                    is_static: false,
-                })
-            }
-        }
+        self.parse_receiver_member_call(receiver, null_safe, member_name, call_kind)
     }
 
     pub(super) fn parse_js_member_value(&mut self, first: String) -> Result<DslValue, String> {
@@ -127,17 +76,7 @@ impl<'a> DslParser<'a> {
                 let target = self
                     .scoped_target_name(&parts[0])
                     .unwrap_or_else(|| DslTarget::Local(parts[0].clone()));
-                return Ok(DslValue::FieldGet {
-                    stmt: Box::new(DslFieldStmt {
-                        target: Some(target),
-                        receiver: None,
-                        class_name: None,
-                        field_name: parts[1].clone(),
-                        type_name: String::new(),
-                        value: None,
-                    }),
-                    is_static: false,
-                });
+                return Ok(self.build_target_field_get(target, parts[1].clone(), None, String::new()));
             }
             return Err(
                 self.err("direct field access currently supports only instance fields on this/arg/local values")
@@ -147,75 +86,11 @@ impl<'a> DslParser<'a> {
 
         if parts.len() == 2 && self.scoped_target_name(&parts[0]).is_some() {
             let target = self.scoped_target_name(&parts[0]).unwrap();
-            match self.parse_member_call_args(true, matches!(target, DslTarget::Last | DslTarget::Result))? {
-                ParsedCallArgs::Direct(args) => Ok(DslValue::Call(DslCallStmt {
-                    kind: DslCallKind::Virtual,
-                    target: Some(target),
-                    receiver: None,
-                    null_safe: false,
-                    class_name: None,
-                    method_name: parts[1].clone(),
-                    sig: String::new(),
-                    args,
-                })),
-                ParsedCallArgs::LegacyCall { class_name, sig, args } => Ok(DslValue::Call(DslCallStmt {
-                    kind: DslCallKind::Virtual,
-                    target: Some(target),
-                    receiver: None,
-                    null_safe: false,
-                    class_name,
-                    method_name: parts[1].clone(),
-                    sig,
-                    args,
-                })),
-                ParsedCallArgs::Field { class_name, type_name } => Ok(DslValue::FieldGet {
-                    stmt: Box::new(DslFieldStmt {
-                        target: Some(target),
-                        receiver: None,
-                        class_name,
-                        field_name: parts[1].clone(),
-                        type_name,
-                        value: None,
-                    }),
-                    is_static: false,
-                }),
-            }
+            self.parse_target_member_call(target, parts[1].clone())
         } else {
             let member_name = parts.pop().unwrap();
             let class_name = parts.join(".");
-            match self.parse_member_call_args(true, false)? {
-                ParsedCallArgs::Direct(args) => Ok(DslValue::Call(DslCallStmt {
-                    kind: DslCallKind::Static,
-                    target: None,
-                    receiver: None,
-                    null_safe: false,
-                    class_name: Some(class_name),
-                    method_name: member_name,
-                    sig: String::new(),
-                    args,
-                })),
-                ParsedCallArgs::LegacyCall { sig, args, .. } => Ok(DslValue::Call(DslCallStmt {
-                    kind: DslCallKind::Static,
-                    target: None,
-                    receiver: None,
-                    null_safe: false,
-                    class_name: Some(class_name),
-                    method_name: member_name,
-                    sig,
-                    args,
-                })),
-                ParsedCallArgs::Field { type_name, .. } => Ok(DslValue::FieldGet {
-                    stmt: Box::new(DslFieldStmt {
-                        target: None,
-                        receiver: None,
-                        class_name: Some(class_name),
-                        field_name: member_name,
-                        type_name,
-                        value: None,
-                    }),
-                    is_static: true,
-                }),
-            }
+            self.parse_static_member_call(class_name, member_name)
         }
     }
 }
