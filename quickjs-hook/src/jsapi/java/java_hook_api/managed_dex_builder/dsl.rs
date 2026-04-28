@@ -4,6 +4,7 @@ mod assignment;
 mod ast;
 mod condition;
 mod control_flow;
+mod control_loop;
 pub(super) use ast::*;
 mod cursor;
 mod declaration;
