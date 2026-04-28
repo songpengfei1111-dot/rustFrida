@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use super::dsl::{
-    DslCallKind, DslCallStmt, DslCondition, DslFieldStmt, DslOrigArgs, DslProgram, DslStmt, DslTarget, DslUnaryOp,
-    DslValue,
+    DslCallKind, DslCallStmt, DslCatch, DslCondition, DslFieldStmt, DslOrigArgs, DslProgram, DslStmt, DslTarget,
+    DslUnaryOp, DslValue,
 };
 use super::{
     array_component_descriptor, common_value_descriptor_with_env, java_class_to_descriptor,
@@ -870,28 +870,11 @@ impl DslSemanticContext {
                     self.validate_stmts(stmts)?;
                 }
             }
-            DslStmt::TryCatch {
-                try_stmts,
-                catch_type,
-                catch_name,
-                catch_stmts,
-            } => {
+            DslStmt::TryCatch { try_stmts, catches } => {
                 self.validate_stmts(try_stmts)?;
-                let catch_descriptor = java_class_to_descriptor(catch_type)?;
-                if !return_is_object(&catch_descriptor) {
-                    return Err(format!("catch type must be an object, got {}", catch_descriptor));
+                for catch in catches {
+                    self.validate_catch_block(catch)?;
                 }
-                if let Some(existing) = self.local_descriptors.get(catch_name) {
-                    if existing != &catch_descriptor {
-                        return Err(format!(
-                            "catch local '{}' type mismatch: existing {}, catch {}",
-                            catch_name, existing, catch_descriptor
-                        ));
-                    }
-                } else {
-                    self.local_descriptors.insert(catch_name.clone(), catch_descriptor);
-                }
-                self.validate_stmts(catch_stmts)?;
             }
             DslStmt::While { condition, body_stmts } => {
                 self.validate_condition(condition)?;
@@ -981,6 +964,28 @@ impl DslSemanticContext {
             }
         }
         Ok(())
+    }
+
+    fn validate_catch_block(&mut self, catch: &DslCatch) -> Result<(), String> {
+        let catch_descriptor = java_class_to_descriptor(&catch.catch_type)?;
+        if !return_is_object(&catch_descriptor) {
+            return Err(format!("catch type must be an object, got {}", catch_descriptor));
+        }
+        if object_assignability_score(self.env, &catch_descriptor, "Ljava/lang/Throwable;").is_none() {
+            return Err(format!("catch type must extend Throwable, got {}", catch_descriptor));
+        }
+        if let Some(existing) = self.local_descriptors.get(&catch.catch_name) {
+            if existing != &catch_descriptor {
+                return Err(format!(
+                    "catch local '{}' type mismatch: existing {}, catch {}",
+                    catch.catch_name, existing, catch_descriptor
+                ));
+            }
+        } else {
+            self.local_descriptors
+                .insert(catch.catch_name.clone(), catch_descriptor);
+        }
+        self.validate_stmts(&catch.catch_stmts)
     }
 }
 

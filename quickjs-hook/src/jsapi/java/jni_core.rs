@@ -950,16 +950,6 @@ pub(crate) fn scoped_jni_env() -> Result<ScopedJniEnv, String> {
     }
 }
 
-pub(crate) fn scoped_jni_env_detach_on_drop() -> Result<ScopedJniEnv, String> {
-    let vm = get_or_init_vm()?;
-    let env = unsafe { attach_current_thread(vm)? };
-    Ok(ScopedJniEnv {
-        vm,
-        env,
-        detach_on_drop: true,
-    })
-}
-
 unsafe fn get_current_thread_env(vm_ptr: *mut std::ffi::c_void) -> Result<Option<JniEnv>, String> {
     let vm_table = *(vm_ptr as *const *const *const std::ffi::c_void);
     let get_env_fn: unsafe extern "C" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void, i32) -> i32 =

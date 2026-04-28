@@ -45,6 +45,12 @@ impl DexCode {
 pub(in crate::jsapi::java::java_hook_api) struct DexTryItem {
     pub start_addr: u32,
     pub insn_count: u16,
+    pub handlers: Vec<DexCatchHandler>,
+    pub catch_all_addr: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::jsapi::java::java_hook_api) struct DexCatchHandler {
     pub handler_type: String,
     pub handler_addr: u32,
 }
@@ -313,11 +319,21 @@ impl DexIrBuilder {
     }
 
     pub(super) fn add_try_item(&mut self, start: DexLabel, end: DexLabel, handler_type: String, handler: DexLabel) {
+        self.add_try_handlers(start, end, vec![IrCatchHandler { handler_type, handler }], None);
+    }
+
+    pub(super) fn add_try_handlers(
+        &mut self,
+        start: DexLabel,
+        end: DexLabel,
+        handlers: Vec<IrCatchHandler>,
+        catch_all: Option<DexLabel>,
+    ) {
         self.try_items.push(IrTryItem {
             start,
             end,
-            handler_type,
-            handler,
+            handlers,
+            catch_all,
         });
     }
 
@@ -355,8 +371,20 @@ impl DexIrBuilder {
             code.try_items.push(DexTryItem {
                 start_addr,
                 insn_count: insn_count as u16,
-                handler_type: item.handler_type,
-                handler_addr: label_offset(item.handler, &self.labels, "catch handler")? as u32,
+                handlers: item
+                    .handlers
+                    .into_iter()
+                    .map(|handler| {
+                        Ok(DexCatchHandler {
+                            handler_type: handler.handler_type,
+                            handler_addr: label_offset(handler.handler, &self.labels, "catch handler")? as u32,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                catch_all_addr: item
+                    .catch_all
+                    .map(|handler| label_offset(handler, &self.labels, "catch-all handler").map(|offset| offset as u32))
+                    .transpose()?,
             });
         }
         Ok(code)
@@ -374,8 +402,13 @@ impl DexIrBuilder {
 struct IrTryItem {
     start: DexLabel,
     end: DexLabel,
-    handler_type: String,
-    handler: DexLabel,
+    handlers: Vec<IrCatchHandler>,
+    catch_all: Option<DexLabel>,
+}
+
+pub(super) struct IrCatchHandler {
+    pub(super) handler_type: String,
+    pub(super) handler: DexLabel,
 }
 
 enum IrInstr {

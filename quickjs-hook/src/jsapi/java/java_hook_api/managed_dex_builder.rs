@@ -71,7 +71,8 @@ impl MethodRef {
 
 mod dex_ir;
 use dex_ir::{
-    value_kind_from_descriptor, DexCode, DexIntBinOp, DexIntLit16Op, DexIntLit8Op, DexIrBuilder, IfCmpOp, ValueKind,
+    value_kind_from_descriptor, DexCode, DexIntBinOp, DexIntLit16Op, DexIntLit8Op, DexIrBuilder, IfCmpOp,
+    IrCatchHandler, ValueKind,
 };
 
 mod dex_writer;

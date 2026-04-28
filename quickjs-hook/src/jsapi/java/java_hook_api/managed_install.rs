@@ -664,7 +664,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_read_counter(
     let Some(helper_cls) = find_dynamic_managed_helper_class(&helper_class) else {
         return throw_internal_error(ctx, format!("managed helper class not found: {}", helper_class));
     };
-    let scoped_env = match scoped_jni_env_detach_on_drop() {
+    let scoped_env = match scoped_jni_env() {
         Ok(env) => env,
         Err(msg) => return throw_internal_error(ctx, msg),
     };

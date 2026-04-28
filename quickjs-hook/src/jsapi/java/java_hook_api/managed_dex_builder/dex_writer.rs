@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::dex_ir::{CodeWord, DexCode};
+use super::dex_ir::{CodeWord, DexCatchHandler, DexCode};
 use super::{FieldRef, MethodRef, ProtoSpec, ACC_FINAL, ACC_PUBLIC};
 
 const TYPE_HEADER_ITEM: u16 = 0x0000;
@@ -210,7 +210,9 @@ impl DexBuilder {
             for method in class.direct_methods.iter().chain(class.virtual_methods.iter()) {
                 if let Some(code) = &method.code {
                     for item in &code.try_items {
-                        type_set.insert(item.handler_type.clone());
+                        for handler in &item.handlers {
+                            type_set.insert(handler.handler_type.clone());
+                        }
                     }
                     for word in &code.insns {
                         match word {
@@ -520,31 +522,85 @@ fn write_code_item(
         }
     }
     if !code.try_items.is_empty() {
+        let (handler_offsets, handler_blob) = build_encoded_catch_handlers(code, type_idx)?;
         if code.insns.len() % 2 != 0 {
             write_u16(out, 0);
         }
-        for item in &code.try_items {
+        for (idx, item) in code.try_items.iter().enumerate() {
             write_u32(out, item.start_addr);
             write_u16(out, item.insn_count);
-            write_u16(out, 1);
+            write_u16(out, handler_offsets[idx]);
         }
-        write_uleb128(out, 1);
-        write_sleb128(out, 1);
-        let first = &code.try_items[0];
-        write_uleb128(
-            out,
-            *type_idx
-                .get(&first.handler_type)
-                .ok_or_else(|| format!("missing catch type index for {}", first.handler_type))?,
-        );
-        write_uleb128(out, first.handler_addr);
-        for item in code.try_items.iter().skip(1) {
-            if item.handler_type != first.handler_type || item.handler_addr != first.handler_addr {
-                return Err("only one catch handler is currently supported per generated method".to_string());
-            }
-        }
+        out.extend_from_slice(&handler_blob);
     }
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EncodedCatchHandler {
+    handlers: Vec<DexCatchHandler>,
+    catch_all_addr: Option<u32>,
+}
+
+fn build_encoded_catch_handlers(
+    code: &DexCode,
+    type_idx: &BTreeMap<String, u32>,
+) -> Result<(Vec<u16>, Vec<u8>), String> {
+    let mut unique_handlers: Vec<EncodedCatchHandler> = Vec::new();
+    let mut handler_indices = Vec::with_capacity(code.try_items.len());
+    for item in &code.try_items {
+        if item.handlers.is_empty() && item.catch_all_addr.is_none() {
+            return Err("try item requires at least one typed catch or catch-all handler".to_string());
+        }
+        let handler = EncodedCatchHandler {
+            handlers: item.handlers.clone(),
+            catch_all_addr: item.catch_all_addr,
+        };
+        let index = unique_handlers
+            .iter()
+            .position(|existing| existing == &handler)
+            .unwrap_or_else(|| {
+                unique_handlers.push(handler);
+                unique_handlers.len() - 1
+            });
+        handler_indices.push(index);
+    }
+
+    let mut handler_blob = Vec::new();
+    write_uleb128(&mut handler_blob, unique_handlers.len() as u32);
+    let mut unique_offsets = Vec::with_capacity(unique_handlers.len());
+    for handler in &unique_handlers {
+        let offset = handler_blob.len();
+        if offset > u16::MAX as usize {
+            return Err(format!("encoded catch handler offset too large: {}", offset));
+        }
+        unique_offsets.push(offset as u16);
+
+        if handler.catch_all_addr.is_some() {
+            write_sleb128(&mut handler_blob, -(handler.handlers.len() as i32));
+        } else {
+            write_sleb128(&mut handler_blob, handler.handlers.len() as i32);
+        }
+        for typed in &handler.handlers {
+            let type_index = *type_idx
+                .get(&typed.handler_type)
+                .ok_or_else(|| format!("missing catch type index for {}", typed.handler_type))?;
+            write_uleb128(&mut handler_blob, type_index);
+            write_uleb128(&mut handler_blob, typed.handler_addr);
+        }
+        if let Some(catch_all_addr) = handler.catch_all_addr {
+            write_uleb128(&mut handler_blob, catch_all_addr);
+        }
+    }
+
+    let mut handler_offsets = Vec::with_capacity(handler_indices.len());
+    for index in handler_indices {
+        let Some(offset) = unique_offsets.get(index).copied() else {
+            return Err("internal encoded catch handler index error".to_string());
+        };
+        handler_offsets.push(offset);
+    }
+    Ok((handler_offsets, handler_blob))
 }
 
 fn lookup_u16<K: Ord + std::fmt::Debug>(map: &BTreeMap<K, u32>, key: &K, kind: &str) -> Result<u16, String> {

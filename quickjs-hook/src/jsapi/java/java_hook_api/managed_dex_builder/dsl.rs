@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::{build_method_sig, build_params_sig, java_class_to_descriptor_or_primitive, IfCmpOp};
 
 pub(super) struct DslProgram {
@@ -101,9 +103,7 @@ pub(super) enum DslStmt {
     },
     TryCatch {
         try_stmts: Vec<DslStmt>,
-        catch_type: String,
-        catch_name: String,
-        catch_stmts: Vec<DslStmt>,
+        catches: Vec<DslCatch>,
     },
     While {
         condition: DslCondition,
@@ -133,6 +133,13 @@ pub(super) enum DslStmt {
     ReturnValue {
         value: Option<DslValue>,
     },
+}
+
+#[derive(Clone)]
+pub(super) struct DslCatch {
+    pub(super) catch_type: String,
+    pub(super) catch_name: String,
+    pub(super) catch_stmts: Vec<DslStmt>,
 }
 
 #[derive(Clone)]
@@ -448,7 +455,7 @@ impl<'a> DslParser<'a> {
     fn parse_block(&mut self) -> Result<Vec<DslStmt>, String> {
         self.skip_ws();
         self.expect_char('{')?;
-        self.parse_statements(true)
+        self.with_local_scope(|parser| parser.parse_statements(true))
     }
 
     fn parse_statement_body(&mut self) -> Result<Vec<DslStmt>, String> {
@@ -456,7 +463,7 @@ impl<'a> DslParser<'a> {
         if self.peek() == Some('{') {
             self.parse_block()
         } else {
-            Ok(vec![self.parse_statement()?])
+            self.with_local_scope(|parser| Ok(vec![parser.parse_statement()?]))
         }
     }
 
@@ -527,6 +534,7 @@ impl<'a> DslParser<'a> {
                 -1
             };
             let name = self.parse_ident()?;
+            let name = self.resolve_local_name_or_source(name);
             self.skip_ws();
             self.expect_char(';')?;
             return Ok(self.local_increment_stmt(name, delta));
@@ -558,6 +566,7 @@ impl<'a> DslParser<'a> {
             let value = self.parse_value_arg()?;
             self.skip_ws();
             self.expect_char(';')?;
+            let name = self.resolve_local_name_or_source(name);
             return Ok(DslStmt::Assign { name, value });
         }
         if let Some(op) = self.peek_compound_assign_op() {
@@ -565,6 +574,7 @@ impl<'a> DslParser<'a> {
             let rhs = self.parse_value_arg()?;
             self.skip_ws();
             self.expect_char(';')?;
+            let name = self.resolve_local_name_or_source(name);
             return Ok(self.local_compound_assign_stmt(name, op, rhs));
         }
         if self.peek_op("++") || self.peek_op("--") {
@@ -577,6 +587,7 @@ impl<'a> DslParser<'a> {
             };
             self.skip_ws();
             self.expect_char(';')?;
+            let name = self.resolve_local_name_or_source(name);
             return Ok(self.local_increment_stmt(name, delta));
         }
         if self.peek() == Some('.') || self.peek() == Some('[') || self.peek_ident("as") {
@@ -656,6 +667,7 @@ impl<'a> DslParser<'a> {
     fn parse_js_let_declaration(&mut self) -> Result<DslStmt, String> {
         self.skip_ws();
         let local_name = self.parse_ident()?;
+        let local_name = self.declare_local(local_name)?;
         self.skip_ws();
         let type_name = if self.peek() == Some(':') {
             self.expect_char(':')?;
@@ -852,6 +864,10 @@ impl<'a> DslParser<'a> {
 
     fn parse_js_for_statement(&mut self) -> Result<DslStmt, String> {
         self.expect_ident("for")?;
+        self.with_local_scope(|parser| parser.parse_js_for_statement_scoped())
+    }
+
+    fn parse_js_for_statement_scoped(&mut self) -> Result<DslStmt, String> {
         self.skip_ws();
         self.expect_char('(')?;
         let init_stmts = if self.peek() == Some(';') {
@@ -920,6 +936,7 @@ impl<'a> DslParser<'a> {
                 -1
             };
             let name = self.parse_ident()?;
+            let name = self.resolve_local_name_or_source(name);
             self.skip_ws();
             return Ok(self.local_increment_stmt(name, delta));
         }
@@ -928,10 +945,12 @@ impl<'a> DslParser<'a> {
         let stmt = if self.peek() == Some('=') {
             self.expect_char('=')?;
             let value = self.parse_value_arg()?;
+            let name = self.resolve_local_name_or_source(name);
             DslStmt::Assign { name, value }
         } else if let Some(op) = self.peek_compound_assign_op() {
             self.consume_compound_assign_op(op)?;
             let rhs = self.parse_value_arg()?;
+            let name = self.resolve_local_name_or_source(name);
             self.local_compound_assign_stmt(name, op, rhs)
         } else if self.peek_op("++") || self.peek_op("--") {
             let delta = if self.peek_op("++") {
@@ -941,6 +960,7 @@ impl<'a> DslParser<'a> {
                 self.expect_op("--")?;
                 -1
             };
+            let name = self.resolve_local_name_or_source(name);
             self.local_increment_stmt(name, delta)
         } else if self.peek() == Some('.') || self.peek() == Some('[') || self.peek_ident("as") {
             let value = self.parse_value_from_ident(name)?;
@@ -1040,22 +1060,35 @@ impl<'a> DslParser<'a> {
     fn parse_js_try_catch_statement(&mut self) -> Result<DslStmt, String> {
         self.expect_ident("try")?;
         let try_stmts = self.parse_block()?;
-        self.skip_ws();
-        self.expect_ident("catch")?;
-        self.skip_ws();
-        self.expect_char('(')?;
-        let catch_type = self.parse_type_name()?;
-        self.skip_ws();
-        let catch_name = self.parse_ident()?;
-        self.skip_ws();
-        self.expect_char(')')?;
-        let catch_stmts = self.parse_block()?;
-        Ok(DslStmt::TryCatch {
-            try_stmts,
-            catch_type,
-            catch_name,
-            catch_stmts,
-        })
+        let mut catches = Vec::new();
+        loop {
+            self.skip_ws();
+            if !self.peek_ident("catch") {
+                break;
+            }
+            self.expect_ident("catch")?;
+            self.skip_ws();
+            self.expect_char('(')?;
+            let catch_type = self.parse_type_name()?;
+            self.skip_ws();
+            let catch_name = self.parse_ident()?;
+            self.skip_ws();
+            self.expect_char(')')?;
+            let (catch_name, catch_stmts) = self.with_local_scope(|parser| {
+                let catch_name = parser.declare_local(catch_name)?;
+                let catch_stmts = parser.parse_block()?;
+                Ok((catch_name, catch_stmts))
+            })?;
+            catches.push(DslCatch {
+                catch_type,
+                catch_name,
+                catch_stmts,
+            });
+        }
+        if catches.is_empty() {
+            return Err(self.err("try requires at least one catch block"));
+        }
+        Ok(DslStmt::TryCatch { try_stmts, catches })
     }
 }
 
@@ -1241,6 +1274,8 @@ struct DslParser<'a> {
     input: &'a str,
     tokens: Vec<DslToken>,
     pos: usize,
+    local_scopes: Vec<BTreeMap<String, String>>,
+    next_local_id: usize,
 }
 
 impl<'a> DslParser<'a> {
@@ -1249,7 +1284,50 @@ impl<'a> DslParser<'a> {
             input,
             tokens: dsl_lex(input)?,
             pos: 0,
+            local_scopes: vec![BTreeMap::new()],
+            next_local_id: 0,
         })
+    }
+
+    fn with_local_scope<F, R>(&mut self, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&mut Self) -> Result<R, String>,
+    {
+        self.local_scopes.push(BTreeMap::new());
+        let result = f(self);
+        self.local_scopes.pop();
+        result
+    }
+
+    fn declare_local(&mut self, source_name: String) -> Result<String, String> {
+        let Some(scope) = self.local_scopes.last_mut() else {
+            return Err(self.err("internal parser scope error"));
+        };
+        if scope.contains_key(&source_name) {
+            return Err(self.err(&format!("local '{}' is already declared in this scope", source_name)));
+        }
+        let internal_name = format!("__rf_l{}_{}", self.next_local_id, source_name);
+        self.next_local_id += 1;
+        scope.insert(source_name, internal_name.clone());
+        Ok(internal_name)
+    }
+
+    fn resolve_local(&self, source_name: &str) -> Option<String> {
+        self.local_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(source_name).cloned())
+    }
+
+    fn resolve_local_name_or_source(&self, source_name: String) -> String {
+        self.resolve_local(&source_name).unwrap_or(source_name)
+    }
+
+    fn scoped_target_name(&self, name: &str) -> Option<DslTarget> {
+        match parse_target_name(name) {
+            Some(DslTarget::Local(local)) => Some(DslTarget::Local(self.resolve_local(&local).unwrap_or(local))),
+            other => other,
+        }
     }
 
     fn skip_ws(&mut self) {}
@@ -1591,7 +1669,7 @@ impl<'a> DslParser<'a> {
         let value = if self.peek() == Some('.') {
             self.parse_js_member_value(ident)?
         } else {
-            let target = parse_target_name(&ident);
+            let target = self.scoped_target_name(&ident);
             let target = target.unwrap_or_else(|| DslTarget::Local(ident));
             DslValue::Target(target)
         };
@@ -1879,12 +1957,16 @@ impl<'a> DslParser<'a> {
             return self.parse_js_new_member_value(parts);
         }
         if parts.len() == 2 && parts[1] == "length" && self.peek() != Some('(') {
-            let target = parse_target_name(&parts[0]).unwrap_or_else(|| DslTarget::Local(parts[0].clone()));
+            let target = self
+                .scoped_target_name(&parts[0])
+                .unwrap_or_else(|| DslTarget::Local(parts[0].clone()));
             return Ok(DslValue::ArrayLength(Box::new(DslValue::Target(target))));
         }
         if self.peek() != Some('(') {
             if parts.len() == 2 && !looks_like_static_class_name(&parts[0]) {
-                let target = parse_target_name(&parts[0]).unwrap_or_else(|| DslTarget::Local(parts[0].clone()));
+                let target = self
+                    .scoped_target_name(&parts[0])
+                    .unwrap_or_else(|| DslTarget::Local(parts[0].clone()));
                 return Ok(DslValue::FieldGet {
                     stmt: Box::new(DslFieldStmt {
                         target: Some(target),
@@ -1903,8 +1985,8 @@ impl<'a> DslParser<'a> {
         }
         self.expect_char('(')?;
 
-        if parts.len() == 2 && parse_target_name(&parts[0]).is_some() {
-            let target = parse_target_name(&parts[0]).unwrap();
+        if parts.len() == 2 && self.scoped_target_name(&parts[0]).is_some() {
+            let target = self.scoped_target_name(&parts[0]).unwrap();
             match self.parse_member_call_args(true, matches!(target, DslTarget::Last | DslTarget::Result))? {
                 ParsedCallArgs::Direct(args) => Ok(DslValue::Call(DslCallStmt {
                     kind: DslCallKind::Virtual,
@@ -2024,8 +2106,8 @@ impl<'a> DslParser<'a> {
         let args = self.parse_value_arg_list_until_close()?;
         self.expect_char(')')?;
 
-        if parts.len() == 1 && parse_target_name(&parts[0]).is_some() {
-            let target = parse_target_name(&parts[0]).unwrap();
+        if parts.len() == 1 && self.scoped_target_name(&parts[0]).is_some() {
+            let target = self.scoped_target_name(&parts[0]).unwrap();
             let (class_name, params) = if call_kind == DslCallKind::Interface {
                 let Some(class_name) = overload_args.first() else {
                     return Err(self.err("interface overload expects overload(\"InterfaceClass\", ...)"));
