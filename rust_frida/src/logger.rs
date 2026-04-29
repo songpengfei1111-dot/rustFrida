@@ -1,10 +1,56 @@
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// 全局 verbose 开关（由 --verbose 标志控制）
 pub static VERBOSE: AtomicBool = AtomicBool::new(false);
+static LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
 
 pub fn is_verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
+}
+
+pub fn init_output_file(path: &str) -> std::io::Result<()> {
+    let file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+    let _ = LOG_FILE.set(Mutex::new(file));
+    Ok(())
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub fn write_log_line(line: &str) {
+    if let Some(file) = LOG_FILE.get() {
+        let mut guard = file.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(guard, "{}", strip_ansi(line));
+        let _ = guard.flush();
+    }
+}
+
+pub fn stdout_line(colored: &str, plain: &str) {
+    println!("{}", colored);
+    write_log_line(plain);
+}
+
+pub fn stderr_line(colored: &str, plain: &str) {
+    eprintln!("{}", colored);
+    write_log_line(plain);
 }
 
 /// ANSI 颜色常量
@@ -28,7 +74,11 @@ pub const HIGHLIGHT_FG: &str = "\x1b[38;5;255m";
 #[macro_export]
 macro_rules! log_info {
     ($($arg:tt)*) => {{
-        println!("{}{} [*]{} {}", $crate::logger::BOLD, $crate::logger::BLUE, $crate::logger::RESET, format_args!($($arg)*));
+        let msg = format!($($arg)*);
+        $crate::logger::stdout_line(
+            &format!("{}{} [*]{} {}", $crate::logger::BOLD, $crate::logger::BLUE, $crate::logger::RESET, msg),
+            &format!("[*] {}", msg),
+        );
     }};
 }
 
@@ -36,7 +86,11 @@ macro_rules! log_info {
 #[macro_export]
 macro_rules! log_success {
     ($($arg:tt)*) => {{
-        println!("{}{} [✓]{} {}", $crate::logger::BOLD, $crate::logger::GREEN, $crate::logger::RESET, format_args!($($arg)*));
+        let msg = format!($($arg)*);
+        $crate::logger::stdout_line(
+            &format!("{}{} [✓]{} {}", $crate::logger::BOLD, $crate::logger::GREEN, $crate::logger::RESET, msg),
+            &format!("[✓] {}", msg),
+        );
     }};
 }
 
@@ -44,7 +98,11 @@ macro_rules! log_success {
 #[macro_export]
 macro_rules! log_warn {
     ($($arg:tt)*) => {{
-        eprintln!("{}{} [!]{} {}", $crate::logger::BOLD, $crate::logger::YELLOW, $crate::logger::RESET, format_args!($($arg)*));
+        let msg = format!($($arg)*);
+        $crate::logger::stderr_line(
+            &format!("{}{} [!]{} {}", $crate::logger::BOLD, $crate::logger::YELLOW, $crate::logger::RESET, msg),
+            &format!("[!] {}", msg),
+        );
     }};
 }
 
@@ -52,7 +110,11 @@ macro_rules! log_warn {
 #[macro_export]
 macro_rules! log_error {
     ($($arg:tt)*) => {{
-        eprintln!("{}{} [✗]{} {}", $crate::logger::BOLD, $crate::logger::RED, $crate::logger::RESET, format_args!($($arg)*));
+        let msg = format!($($arg)*);
+        $crate::logger::stderr_line(
+            &format!("{}{} [✗]{} {}", $crate::logger::BOLD, $crate::logger::RED, $crate::logger::RESET, msg),
+            &format!("[✗] {}", msg),
+        );
     }};
 }
 
@@ -60,7 +122,11 @@ macro_rules! log_error {
 #[macro_export]
 macro_rules! log_step {
     ($($arg:tt)*) => {{
-        println!("{}{} [→]{} {}", $crate::logger::BOLD, $crate::logger::CYAN, $crate::logger::RESET, format_args!($($arg)*));
+        let msg = format!($($arg)*);
+        $crate::logger::stdout_line(
+            &format!("{}{} [→]{} {}", $crate::logger::BOLD, $crate::logger::CYAN, $crate::logger::RESET, msg),
+            &format!("[→] {}", msg),
+        );
     }};
 }
 
@@ -68,12 +134,16 @@ macro_rules! log_step {
 #[macro_export]
 macro_rules! log_addr {
     ($label:expr, $addr:expr) => {{
-        println!(
-            "     {}: {}0x{:x}{}",
-            $label,
-            $crate::logger::DIM,
-            $addr,
-            $crate::logger::RESET
+        let plain = format!("     {}: 0x{:x}", $label, $addr);
+        $crate::logger::stdout_line(
+            &format!(
+                "     {}: {}0x{:x}{}",
+                $label,
+                $crate::logger::DIM,
+                $addr,
+                $crate::logger::RESET
+            ),
+            &plain,
         );
     }};
 }
@@ -83,7 +153,11 @@ macro_rules! log_addr {
 macro_rules! log_verbose {
     ($($arg:tt)*) => {{
         if $crate::logger::is_verbose() {
-            println!("{}{} [→]{} {}", $crate::logger::BOLD, $crate::logger::CYAN, $crate::logger::RESET, format_args!($($arg)*));
+            let msg = format!($($arg)*);
+            $crate::logger::stdout_line(
+                &format!("{}{} [→]{} {}", $crate::logger::BOLD, $crate::logger::CYAN, $crate::logger::RESET, msg),
+                &format!("[→] {}", msg),
+            );
         }
     }};
 }
@@ -93,12 +167,16 @@ macro_rules! log_verbose {
 macro_rules! log_verbose_addr {
     ($label:expr, $addr:expr) => {{
         if $crate::logger::is_verbose() {
-            println!(
-                "     {}: {}0x{:x}{}",
-                $label,
-                $crate::logger::DIM,
-                $addr,
-                $crate::logger::RESET
+            let plain = format!("     {}: 0x{:x}", $label, $addr);
+            $crate::logger::stdout_line(
+                &format!(
+                    "     {}: {}0x{:x}{}",
+                    $label,
+                    $crate::logger::DIM,
+                    $addr,
+                    $crate::logger::RESET
+                ),
+                &plain,
             );
         }
     }};
@@ -108,17 +186,29 @@ macro_rules! log_verbose_addr {
 #[macro_export]
 macro_rules! log_agent {
     ($($arg:tt)*) => {{
-        println!("{}{} [agent]{} {}", $crate::logger::BOLD, $crate::logger::MAGENTA, $crate::logger::RESET, format_args!($($arg)*));
+        let msg = format!($($arg)*);
+        $crate::logger::stdout_line(
+            &format!("{}{} [agent]{} {}", $crate::logger::BOLD, $crate::logger::MAGENTA, $crate::logger::RESET, msg),
+            &format!("[agent] {}", msg),
+        );
     }};
 }
 
 /// 打印 banner
 pub fn print_banner() {
     let version = env!("CARGO_PKG_VERSION");
-    println!(
-        "\n {BOLD}{CYAN}╔══════════════════════════════════════╗{RESET}\n \
-         {BOLD}{CYAN}║{RESET}  {BOLD}      rustFrida v{version:<17} {RESET}{BOLD}{CYAN}║{RESET}\n \
-         {BOLD}{CYAN}║{RESET}  {DIM}  ARM64 Dynamic Instrumentation    {RESET}{BOLD}{CYAN}║{RESET}\n \
-         {BOLD}{CYAN}╚══════════════════════════════════════╝{RESET}\n"
+    stdout_line(
+        &format!(
+            "\n {BOLD}{CYAN}╔══════════════════════════════════════╗{RESET}\n \
+             {BOLD}{CYAN}║{RESET}  {BOLD}      rustFrida v{version:<17} {RESET}{BOLD}{CYAN}║{RESET}\n \
+             {BOLD}{CYAN}║{RESET}  {DIM}  ARM64 Dynamic Instrumentation    {RESET}{BOLD}{CYAN}║{RESET}\n \
+             {BOLD}{CYAN}╚══════════════════════════════════════╝{RESET}\n"
+        ),
+        &format!(
+            "\n ╔══════════════════════════════════════╗\n \
+             ║        rustFrida v{version:<17} ║\n \
+             ║    ARM64 Dynamic Instrumentation    ║\n \
+             ╚══════════════════════════════════════╝\n"
+        ),
     );
 }

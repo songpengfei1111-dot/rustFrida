@@ -219,13 +219,16 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                         if session.id == 0 {
                             log_agent!("{}", msg);
                         } else {
-                            println!(
-                                "{}{} [agent#{}]{} {}",
-                                crate::logger::BOLD,
-                                crate::logger::MAGENTA,
-                                session.id,
-                                crate::logger::RESET,
-                                msg
+                            crate::logger::stdout_line(
+                                &format!(
+                                    "{}{} [agent#{}]{} {}",
+                                    crate::logger::BOLD,
+                                    crate::logger::MAGENTA,
+                                    session.id,
+                                    crate::logger::RESET,
+                                    msg
+                                ),
+                                &format!("[agent#{}] {}", session.id, msg),
                             );
                         }
                     }

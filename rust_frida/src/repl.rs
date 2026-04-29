@@ -323,13 +323,19 @@ pub(crate) fn print_eval_result(session: &Session, timeout_secs: u64) {
         .eval_state
         .recv_timeout(std::time::Duration::from_secs(timeout_secs))
     {
-        None => println!("{YELLOW}[timeout] 等待执行结果超时{RESET}"),
+        None => crate::logger::stdout_line(
+            &format!("{YELLOW}[timeout] 等待执行结果超时{RESET}"),
+            "[timeout] 等待执行结果超时",
+        ),
         Some(Ok(output)) => {
             if !output.is_empty() {
-                println!("{GREEN}=> {}{RESET}", output);
+                crate::logger::stdout_line(&format!("{GREEN}=> {}{RESET}", output), &format!("=> {}", output));
             }
         }
-        Some(Err(err)) => println!("{RED}[JS error] {}{RESET}", err),
+        Some(Err(err)) => crate::logger::stdout_line(
+            &format!("{RED}[JS error] {}{RESET}", err),
+            &format!("[JS error] {}", err),
+        ),
     }
 }
 

@@ -90,6 +90,10 @@ pub(crate) struct Args {
     #[arg(short = 'v', long = "verbose")]
     pub(crate) verbose: bool,
 
+    /// 同步写入日志到指定文件（终端仍正常输出）
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    pub(crate) output: Option<String>,
+
     /// Dump 本机属性到 profile（独立操作，不注入进程）
     ///
     /// 复制 /dev/__properties__/ 二进制文件到 profile 目录，

@@ -46,10 +46,17 @@ use types::get_string_table_names;
 fn main() {
     // Fix #8: 先解析参数（--help/--version 在此退出），再打印 banner
     let args = Args::parse();
-    logger::print_banner();
 
     // 初始化 verbose 模式
     logger::VERBOSE.store(args.verbose, Ordering::Relaxed);
+    if let Some(ref path) = args.output {
+        if let Err(e) = logger::init_output_file(path) {
+            eprintln!("初始化日志文件 '{}' 失败: {}", path, e);
+            std::process::exit(1);
+        }
+    }
+
+    logger::print_banner();
 
     // --dump-props: 独立操作，dump 后退出
     if let Some(ref profile_name) = args.dump_props {
