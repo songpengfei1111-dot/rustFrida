@@ -533,12 +533,8 @@ impl DslSemanticContext {
                     .iter()
                     .map(|arg| self.infer_value_descriptor(arg))
                     .collect::<Result<Vec<_>, _>>()?;
-                let (params, full_sig) = resolve_constructor_proto_with_arg_types(
-                    self.env,
-                    class_name,
-                    ctor_sig.as_deref(),
-                    &arg_types,
-                )?;
+                let (params, full_sig) =
+                    resolve_constructor_proto_with_arg_types(self.env, class_name, ctor_sig.as_deref(), &arg_types)?;
                 if params.len() != args.len() {
                     return Err(format!(
                         "{}.<init>{} expects {} explicit args, got {}",

@@ -21,7 +21,7 @@ use crate::args::Args;
 use crate::communication::{send_command, start_socketpair_handler};
 use crate::injection::inject_via_bootstrapper;
 use crate::process::find_pid_by_name;
-use crate::repl::{print_eval_result, print_help, run_js_repl};
+use crate::repl::{preconfigure_java_stealth_if_declared, print_eval_result, print_help, run_js_repl};
 use crate::session::{Session, SessionManager};
 use crate::spawn;
 use crate::{log_error, log_info, log_success, log_warn};
@@ -141,6 +141,11 @@ fn load_script_on_session(session: &Session, script_path: &str) {
             return;
         }
     };
+
+    if let Err(e) = preconfigure_java_stealth_if_declared(session, &script) {
+        log_error!("[#{}] {}", session.id, e);
+        return;
+    }
 
     // jsinit
     session.eval_state.clear();

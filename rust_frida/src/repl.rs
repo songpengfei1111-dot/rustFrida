@@ -38,6 +38,41 @@ pub(crate) fn build_loadjs_cmd(script: &str, script_path: Option<&str>) -> Strin
     }
 }
 
+pub(crate) fn detect_java_stealth_mode(script: &str) -> Option<i32> {
+    let idx = script.find("Java.setStealth")?;
+    let rest = &script[idx..];
+    let open = rest.find('(')?;
+    let rest = &rest[open + 1..];
+    let close = rest.find(')')?;
+    let arg = rest[..close].trim();
+    let arg = arg.trim_matches(|c: char| c == ';' || c.is_whitespace());
+
+    if arg == "2" || arg == "Hook.RECOMP" || arg == "RECOMP" || arg == "Java.RECOMP" {
+        Some(2)
+    } else if arg == "1" || arg == "true" || arg == "Hook.WXSHADOW" || arg == "WXSHADOW" || arg == "Java.WXSHADOW" {
+        Some(1)
+    } else if arg == "0" || arg == "false" || arg == "Hook.NORMAL" || arg == "NORMAL" || arg == "Java.NORMAL" {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn preconfigure_java_stealth_if_declared(session: &Session, script: &str) -> Result<(), String> {
+    let Some(mode) = detect_java_stealth_mode(script) else {
+        return Ok(());
+    };
+    let sender = session.get_sender().ok_or_else(|| "agent 未连接".to_string())?;
+    log_info!("脚本声明 Java.setStealth({})，预配置到 artinit/jsinit 之前", mode);
+    session.eval_state.clear();
+    send_command(sender, format!("javastealth {}", mode)).map_err(|e| format!("发送 javastealth 失败: {}", e))?;
+    match session.eval_state.recv_timeout(std::time::Duration::from_secs(10)) {
+        None => Err("等待 javastealth 超时".to_string()),
+        Some(Err(e)) => Err(format!("javastealth 失败: {}", e)),
+        Some(Ok(_)) => Ok(()),
+    }
+}
+
 /// 当前构建实际可用的命令列表（编译时由 feature 控制）
 pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)] {
     static CMDS: OnceLock<Vec<(&'static str, &'static str, &'static str)>> = OnceLock::new();
@@ -263,6 +298,8 @@ pub(crate) fn load_script_file(session: &Session, script_path: &str, reset: bool
     } else {
         log_info!("加载脚本: {}", script_path);
     }
+
+    preconfigure_java_stealth_if_declared(session, &script)?;
 
     session.eval_state.clear();
     send_command(sender, "jsinit").map_err(|e| format!("发送 jsinit 失败: {}", e))?;

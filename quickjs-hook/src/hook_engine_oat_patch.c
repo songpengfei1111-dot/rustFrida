@@ -21,12 +21,22 @@
 /* Stealth 模式: 0=normal(mprotect), 1=wxshadow, 2=recomp */
 static int g_stealth_mode = 0;
 static recomp_translate_fn g_recomp_translate = NULL;
+static recomp_translate_fn g_recomp_existing_translate = NULL;
+static recomp_reverse_translate_fn g_recomp_reverse_translate = NULL;
 
 void hook_set_recomp_translate(recomp_translate_fn fn) {
     g_recomp_translate = fn;
     /* 仅在设置 recomp 回调时更新 stealth mode 为 2;
      * 清除回调时不重置 mode (由 hook_set_stealth_mode 单独控制) */
     if (fn) g_stealth_mode = 2;
+}
+
+void hook_set_recomp_existing_translate(recomp_translate_fn fn) {
+    g_recomp_existing_translate = fn;
+}
+
+void hook_set_recomp_reverse_translate(recomp_reverse_translate_fn fn) {
+    g_recomp_reverse_translate = fn;
 }
 
 void hook_set_stealth_mode(int mode) {
@@ -61,9 +71,11 @@ typedef struct {
 
 typedef struct {
     uint64_t original_addr;     /* address of patched code in libart */
+    uint64_t patched_addr;      /* actual address written: original_addr or recomp translation */
     void*    oat_thunk;         /* inline patch 直接跳转目标 (thunk 角色,在 patch_addr 附近) */
     uint8_t  original_bytes[24]; /* saved original bytes (up to 20 needed) */
     int      patch_size;        /* bytes overwritten */
+    int      stealth_mode;      /* mode used when this patch was applied */
 } OatInlinePatchEntry;
 
 static OatInlinePatchEntry g_oat_patches[MAX_OAT_INLINE_PATCHES];
@@ -93,6 +105,12 @@ uint64_t hook_oat_pc_pool_bypass_check(uint64_t pc) {
         return 0;
     __atomic_fetch_add(&g_oat_pc_pool_bypass_count, 1, __ATOMIC_RELAXED);
     return 1;
+}
+
+uint64_t hook_oat_recomp_translate_pc(uint64_t pc) {
+    if (!g_recomp_reverse_translate)
+        return 0;
+    return (uint64_t)g_recomp_reverse_translate((uintptr_t)pc);
 }
 
 /* ============================================================================
@@ -381,6 +399,26 @@ static void emit_oat_restore_regs(Arm64Writer* w) {
     arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, OAT_SAVE_FRAME_SIZE);
 }
 
+static void emit_oat_exec_inflight_inc_preserve(Arm64Writer* w) {
+    arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 16);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17,
+        ARM64_REG_SP, 0, ARM64_INDEX_SIGNED_OFFSET);
+    emit_thunk_inflight_inc(w);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17,
+        ARM64_REG_SP, 0, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 16);
+}
+
+static void emit_oat_exec_inflight_dec_preserve(Arm64Writer* w) {
+    arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 16);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X14, ARM64_REG_X15,
+        ARM64_REG_SP, 0, ARM64_INDEX_SIGNED_OFFSET);
+    emit_thunk_inflight_dec_regs(w, ARM64_REG_X14, ARM64_REG_X15);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X14, ARM64_REG_X15,
+        ARM64_REG_SP, 0, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 16);
+}
+
 /* ============================================================================
  * Trampoline generation
  *
@@ -412,7 +450,7 @@ static void* generate_oat_inline_thunk(
      * 这样 apply_oat_inline_patch 可以用 ADRP+ADD+BR (12字节) 跳过来，
      * 只覆盖 pattern 的 3 条指令，不会吞掉第 4 条 ADRP。
      * 如果 near_range 失败（非 stealth2），退回 hook_alloc_near。 */
-    void* oat_thunk = hook_alloc_near_range(512, (void*)(uintptr_t)patch_addr, (int64_t)1 << 27);
+    void* oat_thunk = hook_alloc_near_range(1024, (void*)(uintptr_t)patch_addr, (int64_t)1 << 27);
     if (!oat_thunk) {
         oat_thunk = hook_alloc_near(512, (void*)(uintptr_t)patch_addr);
         /* 检查回退后实际距离: > ±4GB 则 patch 走 16/20B MOVZ 序列, 有溢出 OAT pattern (4 指令 = 16B)
@@ -433,16 +471,22 @@ static void* generate_oat_inline_thunk(
     }
 
     Arm64Writer w;
-    arm64_writer_init(&w, oat_thunk, (uint64_t)oat_thunk, 512);
+    arm64_writer_init(&w, oat_thunk, (uint64_t)oat_thunk, 1024);
+    emit_oat_exec_inflight_inc_preserve(&w);
 
     /* Labels */
     uint64_t lbl_runtime_or_replacement = arm64_writer_new_label_id(&w);
     uint64_t lbl_regular_method = arm64_writer_new_label_id(&w);
     uint64_t lbl_restore_runtime = arm64_writer_new_label_id(&w);
 
-    /* --- Step 1: Relocate instructions covered by the redirect ---
-     * 前 3 条已知: LDR + CMN + B.EQ (12 bytes)。
-     * 如果 redirect > 12 bytes，额外的指令也需要 relocate。 */
+    /* --- Step 1: Relocate the fixed selector prologue ---
+     * 前 3 条已知: LDR + CMN + B.cond。
+     *
+     * 不要在这里按 redirect 长度继续搬运第 4 条指令。第 4 条属于
+     * regular/runtime fall-through 路径，必须等我们判定完 data_ 和
+     * replacement/recomp PC 后，只在对应 tail 里执行一次。否则 16B
+     * redirect 会把第 4 条提前到条件分支之前，破坏 WalkStack 原始语义。
+     */
     Arm64Relocator reloc;
     arm64_relocator_init(&reloc, original_bytes, patch_addr, &w);
     arm64_relocator_read_one(&reloc);  /* LDR */
@@ -455,13 +499,7 @@ static void* generate_oat_inline_thunk(
     arm64_relocator_read_one(&reloc);
     arm64_relocator_skip_one(&reloc);
 
-    /* Relocate any extra instructions covered by the redirect (beyond the 3 known ones) */
-    int relocated_bytes = 12; /* LDR(4) + CMN(4) + B.EQ(4) */
-    while (relocated_bytes < patch_size && !arm64_relocator_eoi(&reloc)) {
-        arm64_relocator_read_one(&reloc);
-        arm64_relocator_write_one(&reloc);
-        relocated_bytes += 4;
-    }
+    (void)patch_size;
     arm64_writer_put_b_cond_label(&w, ARM64_COND_EQ, lbl_runtime_or_replacement);
 
     /* --- Step 3: Save caller-saved registers --- */
@@ -516,6 +554,18 @@ static void* generate_oat_inline_thunk(
     arm64_writer_put_call_address(&w, (uint64_t)hook_oat_pc_pool_bypass_check);
     arm64_writer_put_cbnz_reg_label(&w, ARM64_REG_X0, lbl_restore_runtime);
 
+    /* Recomp stealth executes original OAT code from an anonymous mirror page.
+     * ART's inlined GetOatQuickMethodHeader logic must compare/lookup using
+     * the original OAT PC, otherwise StackVisitor can pair a regular ArtMethod
+     * with an anonymous quick PC and crash or block app-side suspend checks. */
+    uint64_t lbl_no_recomp_pc = arm64_writer_new_label_id(&w);
+    arm64_writer_put_mov_reg_reg(&w, ARM64_REG_X0,
+        (Arm64Reg)(ARM64_REG_X0 + match->pc_reg));
+    arm64_writer_put_call_address(&w, (uint64_t)hook_oat_recomp_translate_pc);
+    arm64_writer_put_cbz_reg_label(&w, ARM64_REG_X0, lbl_no_recomp_pc);
+    arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_SP, match->pc_reg * 8);
+    arm64_writer_put_label(&w, lbl_no_recomp_pc);
+
     /* --- Step 5: Call is_replacement_in_table(method) --- */
     /* MOV X0, Xmethod */
     arm64_writer_put_mov_reg_reg(&w, ARM64_REG_X0,
@@ -560,20 +610,24 @@ static void* generate_oat_inline_thunk(
         arm64_writer_put_label(&w, lbl_regular_method);
         arm64_relocator_read_one(&reloc);  /* insn3 */
         arm64_relocator_write_one(&reloc);
+        emit_oat_exec_inflight_dec_preserve(&w);
         arm64_writer_put_branch_address(&w, patch_addr + 16);
 
         /* runtime_or_replacement: jump to original runtime target */
         arm64_writer_put_label(&w, lbl_runtime_or_replacement);
+        emit_oat_exec_inflight_dec_preserve(&w);
         arm64_writer_put_branch_address(&w, match->target_when_true);
     } else {
         /* regular_method: jump to original branch target (regular method path) */
         arm64_writer_put_label(&w, lbl_regular_method);
+        emit_oat_exec_inflight_dec_preserve(&w);
         arm64_writer_put_branch_address(&w, match->target_when_true);
 
         /* runtime_or_replacement: relocate insn3, continue as runtime */
         arm64_writer_put_label(&w, lbl_runtime_or_replacement);
         arm64_relocator_read_one(&reloc);  /* insn3 */
         arm64_relocator_write_one(&reloc);
+        emit_oat_exec_inflight_dec_preserve(&w);
         arm64_writer_put_branch_address(&w, patch_addr + 16);
     }
 
@@ -804,8 +858,20 @@ int hook_patch_inlined_oat_header_checks(void) {
         }
 
         entry->original_addr = match_addrs[i];
+        entry->patched_addr = (g_stealth_mode == 2 && g_recomp_existing_translate)
+            ? g_recomp_existing_translate(match_addrs[i])
+            : 0;
+        if (entry->patched_addr == 0 && g_stealth_mode == 2 && g_recomp_translate) {
+            entry->patched_addr = g_recomp_existing_translate
+                ? g_recomp_existing_translate(match_addrs[i])
+                : 0;
+        }
+        if (entry->patched_addr == 0) {
+            entry->patched_addr = match_addrs[i];
+        }
         entry->oat_thunk = oat_thunk;
         entry->patch_size = patch_size;
+        entry->stealth_mode = g_stealth_mode;
         g_oat_patch_count++;
         patched++;
 
@@ -829,17 +895,25 @@ int hook_restore_inlined_oat_header_patches(void) {
         size_t page_size = g_engine.exec_mem_page_size;
         uintptr_t page_start = entry->original_addr & ~(page_size - 1);
 
-        /* 按 stealth 模式 restore */
-        if (g_stealth_mode == 2 && g_recomp_translate) {
-            uintptr_t recomp_addr = g_recomp_translate(entry->original_addr);
+        /* Restore with the mode used at install time. Java.setStealth() can be
+         * called after spawn artinit; using the current global mode here can
+         * leave a normal libart patch active and later jump into unmapped pool. */
+        if (entry->stealth_mode == 2) {
+            uintptr_t recomp_addr = entry->patched_addr;
+            if (recomp_addr == entry->original_addr && g_recomp_existing_translate) {
+                recomp_addr = g_recomp_existing_translate(entry->original_addr);
+            }
             if (recomp_addr) {
                 uintptr_t rp = recomp_addr & ~(page_size - 1);
                 mprotect((void*)rp, page_size * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
                 memcpy((void*)recomp_addr, entry->original_bytes, entry->patch_size);
                 mprotect((void*)rp, page_size * 2, PROT_READ | PROT_EXEC);
                 hook_flush_cache((void*)recomp_addr, entry->patch_size);
+            } else {
+                hook_log("[oat_patch] restore skipped: no existing recomp mapping for %#lx",
+                         (unsigned long)entry->original_addr);
             }
-        } else if (g_stealth_mode == 1) {
+        } else if (entry->stealth_mode == 1) {
             if (wxshadow_release((void*)entry->original_addr) != 0) {
                 /* stealth1: wxshadow release 失败不降级 mprotect。
                  * shadow 页随进程退出由内核自动释放，不影响稳定性。 */
@@ -860,6 +934,8 @@ int hook_restore_inlined_oat_header_patches(void) {
             hook_flush_cache((void*)entry->original_addr, entry->patch_size);
         }
         entry->original_addr = 0;
+        entry->patched_addr = 0;
+        entry->stealth_mode = 0;
         restored++;
     }
 

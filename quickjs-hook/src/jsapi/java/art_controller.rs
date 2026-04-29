@@ -19,7 +19,7 @@
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::output_verbose;
 use crate::jsapi::module::{libart_dlsym, module_dlsym};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use super::art_method::{get_instrumentation_spec, read_entry_point, ArtBridgeFunctions, ART_BRIDGE_FUNCTIONS};
@@ -43,9 +43,115 @@ static STEALTH_MODE: AtomicU8 = AtomicU8::new(StealthMode::Normal as u8);
 /// Recomp 翻译回调：供 C 层 oat_patch 使用
 unsafe extern "C" fn recomp_translate_for_c(orig_addr: usize) -> usize {
     match crate::recomp::ensure_and_translate(orig_addr) {
-        Ok(addr) => addr,
+        Ok(addr) => {
+            register_recomp_signal_range(orig_addr, addr);
+            if let Some(entry) = resolve_suspend_poll_entrypoint() {
+                let _ = crate::recomp::patch_suspend_polls(orig_addr, entry);
+            }
+            addr
+        }
         Err(_) => 0,
     }
+}
+
+unsafe extern "C" fn recomp_existing_translate_for_c(orig_addr: usize) -> usize {
+    crate::recomp::translate_existing(orig_addr).unwrap_or(0)
+}
+
+unsafe extern "C" fn recomp_reverse_translate_for_c(recomp_addr: usize) -> usize {
+    crate::recomp::translate_recomp_to_orig(recomp_addr).unwrap_or(0)
+}
+
+const MAX_SIGNAL_RECOMP_RANGES: usize = 128;
+const ART_FAULT_MANAGER_GENERATED_RANGES_OFFSET: usize = 0x28;
+static SIGNAL_RECOMP_RANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SIGNAL_RECOMP_ORIG_BASES: [AtomicUsize; MAX_SIGNAL_RECOMP_RANGES] =
+    [const { AtomicUsize::new(0) }; MAX_SIGNAL_RECOMP_RANGES];
+static SIGNAL_RECOMP_BASES: [AtomicUsize; MAX_SIGNAL_RECOMP_RANGES] =
+    [const { AtomicUsize::new(0) }; MAX_SIGNAL_RECOMP_RANGES];
+
+#[repr(C)]
+struct ArtGeneratedCodeRangeNode {
+    next: AtomicUsize,
+    start: AtomicUsize,
+    size: AtomicUsize,
+}
+
+static ART_RECOMP_RANGE_NODES: [ArtGeneratedCodeRangeNode; MAX_SIGNAL_RECOMP_RANGES] = [const {
+    ArtGeneratedCodeRangeNode {
+        next: AtomicUsize::new(0),
+        start: AtomicUsize::new(0),
+        size: AtomicUsize::new(0),
+    }
+}; MAX_SIGNAL_RECOMP_RANGES];
+
+fn register_recomp_signal_range(orig_addr: usize, recomp_addr: usize) {
+    const PAGE_SIZE: usize = 0x1000;
+    let orig_base = orig_addr & !(PAGE_SIZE - 1);
+    let recomp_base = recomp_addr & !(PAGE_SIZE - 1);
+    let count = SIGNAL_RECOMP_RANGE_COUNT.load(Ordering::Acquire);
+    let limit = count.min(MAX_SIGNAL_RECOMP_RANGES);
+    for i in 0..limit {
+        if SIGNAL_RECOMP_BASES[i].load(Ordering::Acquire) == recomp_base {
+            return;
+        }
+    }
+    if count >= MAX_SIGNAL_RECOMP_RANGES {
+        return;
+    }
+    SIGNAL_RECOMP_ORIG_BASES[count].store(orig_base, Ordering::Release);
+    SIGNAL_RECOMP_BASES[count].store(recomp_base, Ordering::Release);
+    // Do not insert the recomp page into ART FaultManager's generated-code
+    // list. If ART handles the suspend-poll fault itself, it saves the
+    // anonymous recomp PC as the callee-save return PC; later GC root scanning
+    // pairs that PC with the original OAT stack map and can crash in
+    // ReferenceMapVisitor. Keep the range only in our signal-safe side table so
+    // the front SIGSEGV guard can translate LR to the original OAT PC.
+    SIGNAL_RECOMP_RANGE_COUNT.store(count + 1, Ordering::Release);
+}
+
+unsafe fn register_recomp_art_fault_range(index: usize, recomp_base: usize, size: usize) {
+    let fault_manager = libart_dlsym("_ZN3art13fault_managerE");
+    if fault_manager.is_null() {
+        return;
+    }
+
+    let node = &ART_RECOMP_RANGE_NODES[index];
+    node.start.store(recomp_base, Ordering::Release);
+    node.size.store(size, Ordering::Release);
+
+    let head_addr = (fault_manager as usize + ART_FAULT_MANAGER_GENERATED_RANGES_OFFSET) as *const AtomicUsize;
+    let head = &*head_addr;
+    let node_ptr = node as *const ArtGeneratedCodeRangeNode as usize;
+    loop {
+        let old_head = head.load(Ordering::Acquire);
+        node.next.store(old_head, Ordering::Relaxed);
+        if head
+            .compare_exchange(old_head, node_ptr, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+}
+
+fn translate_recomp_to_orig_signal_safe(addr: usize) -> Option<usize> {
+    const PAGE_SIZE: usize = 0x1000;
+    let count = SIGNAL_RECOMP_RANGE_COUNT.load(Ordering::Acquire);
+    let limit = count.min(MAX_SIGNAL_RECOMP_RANGES);
+    for i in 0..limit {
+        let recomp_base = SIGNAL_RECOMP_BASES[i].load(Ordering::Acquire);
+        if recomp_base == 0 {
+            continue;
+        }
+        if addr.wrapping_sub(recomp_base) < PAGE_SIZE {
+            let orig_base = SIGNAL_RECOMP_ORIG_BASES[i].load(Ordering::Acquire);
+            if orig_base != 0 {
+                return Some(orig_base + (addr - recomp_base));
+            }
+        }
+    }
+    None
 }
 
 /// 设置 stealth 模式
@@ -61,8 +167,16 @@ pub(super) fn set_stealth_mode(mode: StealthMode) {
     unsafe {
         hook_ffi::hook_set_stealth_mode(mode as i32);
         match mode {
-            StealthMode::Recomp => hook_ffi::hook_set_recomp_translate(Some(recomp_translate_for_c)),
-            _ => hook_ffi::hook_set_recomp_translate(None),
+            StealthMode::Recomp => {
+                hook_ffi::hook_set_recomp_translate(Some(recomp_translate_for_c));
+                hook_ffi::hook_set_recomp_existing_translate(Some(recomp_existing_translate_for_c));
+                hook_ffi::hook_set_recomp_reverse_translate(Some(recomp_reverse_translate_for_c));
+            }
+            _ => {
+                hook_ffi::hook_set_recomp_translate(None);
+                hook_ffi::hook_set_recomp_existing_translate(None);
+                hook_ffi::hook_set_recomp_reverse_translate(None);
+            }
         }
     }
 
@@ -72,6 +186,10 @@ pub(super) fn set_stealth_mode(mode: StealthMode) {
 /// 查询当前 stealth 模式
 pub(super) fn stealth_mode() -> StealthMode {
     StealthMode::from_js_arg(STEALTH_MODE.load(Ordering::Relaxed) as i64)
+}
+
+pub(super) fn art_controller_initialized() -> bool {
+    ART_CONTROLLER.lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
 /// stealth2 slot 模式 trampoline 修复：hook engine 从 slot 读到的是清零字节，
@@ -141,8 +259,13 @@ unsafe fn prepare_hook_target_inner(
         StealthMode::Recomp => {
             // Recomp 模式: recomp 代码页上写 1 条 B→slot，slot 里由 hook engine 写 thunk。
             // sflag=0 让 hook engine 把 slot 当普通地址处理，无需知道 stealth2。
-            crate::recomp::ensure_and_translate(real_addr as usize)
+            let recomp_addr = crate::recomp::ensure_and_translate(real_addr as usize)
                 .map_err(|e| format!("recomp translate {:#x}: {}", real_addr, e))?;
+            register_recomp_signal_range(real_addr as usize, recomp_addr);
+            if let Some(entry) = resolve_suspend_poll_entrypoint() {
+                crate::recomp::patch_suspend_polls(real_addr as usize, entry)
+                    .map_err(|e| format!("recomp suspend patch {:#x}: {}", real_addr, e))?;
+            }
             let slot = crate::recomp::alloc_trampoline_slot(real_addr as usize)
                 .map_err(|e| format!("recomp slot {:#x}: {}", real_addr, e))?;
             Ok((slot as u64, 0))
@@ -516,10 +639,10 @@ pub(super) fn ensure_art_controller_initialized(
             };
             if ret == 0 {
                 unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), addr) };
-                do_call_targets.push(addr);
+                do_call_targets.push(ha);
                 output_verbose(&format!(
-                    "[artController] Layer 2: DoCall[{}] hook 安装成功: {:#x}",
-                    i, addr
+                    "[artController] Layer 2: DoCall[{}] hook 安装成功: {:#x} (hooked={:#x})",
+                    i, addr, ha
                 ));
             } else {
                 output_verbose(&format!(
@@ -556,10 +679,10 @@ pub(super) fn ensure_art_controller_initialized(
                     bridge.gc_copying_phase,
                 )
             };
-            gc_hook_targets.push(bridge.gc_copying_phase);
+            gc_hook_targets.push(ha);
             output_verbose(&format!(
-                "[artController] GC CopyingPhase hook 安装成功: {:#x}",
-                bridge.gc_copying_phase
+                "[artController] GC CopyingPhase hook 安装成功: {:#x} (hooked={:#x})",
+                bridge.gc_copying_phase, ha
             ));
         } else {
             output_verbose(&format!(
@@ -589,10 +712,10 @@ pub(super) fn ensure_art_controller_initialized(
                     bridge.gc_collect_internal,
                 )
             };
-            gc_hook_targets.push(bridge.gc_collect_internal);
+            gc_hook_targets.push(ha);
             output_verbose(&format!(
-                "[artController] GC CollectGarbageInternal hook 安装成功: {:#x}",
-                bridge.gc_collect_internal
+                "[artController] GC CollectGarbageInternal hook 安装成功: {:#x} (hooked={:#x})",
+                bridge.gc_collect_internal, ha
             ));
         } else {
             output_verbose(&format!(
@@ -622,10 +745,10 @@ pub(super) fn ensure_art_controller_initialized(
                     bridge.run_flip_function,
                 )
             };
-            gc_hook_targets.push(bridge.run_flip_function);
+            gc_hook_targets.push(ha);
             output_verbose(&format!(
-                "[artController] GC RunFlipFunction hook 安装成功: {:#x}",
-                bridge.run_flip_function
+                "[artController] GC RunFlipFunction hook 安装成功: {:#x} (hooked={:#x})",
+                bridge.run_flip_function, ha
             ));
         } else {
             output_verbose(&format!(
@@ -652,10 +775,10 @@ pub(super) fn ensure_art_controller_initialized(
         };
         if !trampoline.is_null() {
             unsafe { try_fixup_trampoline(trampoline, bridge.get_oat_quick_method_header) };
-            oat_header_hook_target = bridge.get_oat_quick_method_header;
+            oat_header_hook_target = ha;
             output_verbose(&format!(
-                "[artController] GetOatQuickMethodHeader hook 安装成功: {:#x}, trampoline={:#x}",
-                bridge.get_oat_quick_method_header, trampoline as u64
+                "[artController] GetOatQuickMethodHeader hook 安装成功: {:#x} (hooked={:#x}), trampoline={:#x}",
+                bridge.get_oat_quick_method_header, ha, trampoline as u64
             ));
         } else {
             output_verbose(&format!(
@@ -687,10 +810,10 @@ pub(super) fn ensure_art_controller_initialized(
                     bridge.fixup_static_trampolines,
                 )
             };
-            fixup_hook_target = bridge.fixup_static_trampolines;
+            fixup_hook_target = ha;
             output_verbose(&format!(
-                "[artController] FixupStaticTrampolines hook 安装成功: {:#x}",
-                bridge.fixup_static_trampolines
+                "[artController] FixupStaticTrampolines hook 安装成功: {:#x} (hooked={:#x})",
+                bridge.fixup_static_trampolines, ha
             ));
         } else {
             output_verbose(&format!(
@@ -724,10 +847,10 @@ pub(super) fn ensure_art_controller_initialized(
                     bridge.pretty_method,
                 )
             };
-            pretty_method_hook_target = bridge.pretty_method;
+            pretty_method_hook_target = ha;
             output_verbose(&format!(
-                "[artController] PrettyMethod hook 安装成功: {:#x}",
-                bridge.pretty_method
+                "[artController] PrettyMethod hook 安装成功: {:#x} (hooked={:#x})",
+                bridge.pretty_method, ha
             ));
         } else {
             output_verbose(&format!(
@@ -1257,6 +1380,16 @@ unsafe extern "C" fn on_get_oat_quick_method_header(
         return;
     }
 
+    if let Some(orig_pc) = crate::recomp::translate_recomp_to_orig(pc as usize) {
+        let trampoline = ctx.trampoline;
+        if !trampoline.is_null() {
+            ctx.x[1] = orig_pc as u64;
+            let result = hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline);
+            (*ctx_ptr).x[0] = result;
+        }
+        return;
+    }
+
     if is_replacement_method(method) || stack_replacement_source(method).is_some() {
         // replacement method → NULL (让 StackVisitor 走 IsNative 兜底)
         ctx.x[0] = 0;
@@ -1403,6 +1536,17 @@ static DUMMY_OAT_HEADER_BUF: [u8; 64] = [0u8; 64];
 static mut PREV_SIGSEGV_ACTION: libc::sigaction = unsafe { std::mem::zeroed() };
 static WALKSTACK_GUARD_INSTALLED: AtomicBool = AtomicBool::new(false);
 
+unsafe fn bionic_sigaction(sig: libc::c_int, act: *const libc::sigaction, oldact: *mut libc::sigaction) -> libc::c_int {
+    let sym = module_dlsym("libc.so", "sigaction");
+    if !sym.is_null() {
+        type SigactionFn =
+            unsafe extern "C" fn(libc::c_int, *const libc::sigaction, *mut libc::sigaction) -> libc::c_int;
+        let sigaction_fn: SigactionFn = std::mem::transmute(sym);
+        return sigaction_fn(sig, act, oldact);
+    }
+    libc::sigaction(sig, act, oldact)
+}
+
 // ============================================================================
 // Managed DSL implicit suspend SIGSEGV fallback
 // ============================================================================
@@ -1427,6 +1571,32 @@ struct SigchainAction {
 static IMPLICIT_SUSPEND_GUARD_INSTALLED: AtomicBool = AtomicBool::new(false);
 static IMPLICIT_SUSPEND_ENTRYPOINT: AtomicU64 = AtomicU64::new(0);
 static IMPLICIT_SUSPEND_TRIGGER_OFFSET: AtomicU64 = AtomicU64::new(INVALID_THREAD_OFFSET);
+static IMPLICIT_SUSPEND_THREAD_CURRENT: AtomicU64 = AtomicU64::new(0);
+
+fn resolve_suspend_poll_entrypoint() -> Option<usize> {
+    let cached = IMPLICIT_SUSPEND_ENTRYPOINT.load(Ordering::Relaxed) as usize;
+    if cached != 0 {
+        return Some(cached);
+    }
+
+    let implicit = unsafe { libart_dlsym("art_quick_implicit_suspend") as usize };
+    if implicit != 0 {
+        IMPLICIT_SUSPEND_ENTRYPOINT.store(implicit as u64, Ordering::Relaxed);
+        return Some(implicit);
+    }
+
+    let test_suspend = unsafe { super::java_fast_api::art_quick_test_suspend_entrypoint() as usize };
+    if test_suspend != 0 {
+        output_verbose(&format!(
+            "[artController] art_quick_implicit_suspend 未导出，使用 quick test-suspend entrypoint={:#x}",
+            test_suspend
+        ));
+        IMPLICIT_SUSPEND_ENTRYPOINT.store(test_suspend as u64, Ordering::Relaxed);
+        return Some(test_suspend);
+    }
+
+    None
+}
 
 fn arm64_self_ldr_reg(inst: u32) -> Option<usize> {
     // LDR Xt, [Xn, #0]. ART normally uses `ldr x21, [x21]` for implicit
@@ -1470,27 +1640,44 @@ unsafe fn try_handle_managed_implicit_suspend(
         return false;
     }
 
-    let inst = core::ptr::read_unaligned(pc as *const u32);
-    let Some(suspend_reg) = arm64_self_ldr_reg(inst) else {
-        return false;
+    let translated_pc = translate_recomp_to_orig_signal_safe(pc as usize);
+    let instr_pc = translated_pc.unwrap_or(pc as usize);
+    let inst = core::ptr::read_unaligned(instr_pc as *const u32);
+    let poll_pc = if inst == 0xf940_02b5 {
+        instr_pc
+    } else {
+        let next_instr_pc = instr_pc.wrapping_add(4);
+        let next_inst = core::ptr::read_unaligned(next_instr_pc as *const u32);
+        if next_inst == 0xf940_02b5 {
+            next_instr_pc
+        } else {
+            return false;
+        }
     };
-
-    let thread = mc.regs[19] & PAC_STRIP_MASK;
-    if thread == 0 || (thread & 0x7) != 0 {
-        return false;
+    // AOSP arm64 SuspensionHandler matches this exact poll instruction:
+    //   ldr x21, [x21]
+    // Do not require extra Thread/suspend_trigger validation here. In boot/JIT
+    // quick frames reached through recomp, that validation can be stale while
+    // the instruction match is still definitive.
+    let current_fn = IMPLICIT_SUSPEND_THREAD_CURRENT.load(Ordering::Relaxed);
+    let thread = if current_fn != 0 {
+        let thread_current: unsafe extern "C" fn() -> u64 = core::mem::transmute(current_fn as usize);
+        thread_current() & PAC_STRIP_MASK
+    } else {
+        mc.regs[19] & PAC_STRIP_MASK
+    };
+    if thread != 0 && (thread & 0x7) == 0 {
+        let suspend_trigger_addr = thread.wrapping_add(offset);
+        core::ptr::write(suspend_trigger_addr as *mut u64, suspend_trigger_addr);
+        mc.regs[19] = thread;
     }
 
-    let suspend_trigger_addr = thread.wrapping_add(offset);
-    let stored_trigger = core::ptr::read(suspend_trigger_addr as *const u64);
-    let fault_addr = (*info).si_addr() as u64;
-    let reg_value = mc.regs[suspend_reg] & PAC_STRIP_MASK;
-    if stored_trigger != reg_value && stored_trigger != fault_addr {
-        return false;
-    }
-
-    core::ptr::write(suspend_trigger_addr as *mut u64, suspend_trigger_addr);
-
-    mc.regs[30] = pc.wrapping_add(4);
+    // ART saves LR in the implicit-suspend callee-save frame and later uses it
+    // as the quick frame PC while visiting GC roots. If this stays as the
+    // anonymous recomp PC, StackVisitor can pair the original OAT header with a
+    // recomp PC and decode the wrong stack-map offset. Keep execution semantics
+    // equivalent by resuming at the original OAT instruction after the poll.
+    mc.regs[30] = (poll_pc as u64).wrapping_add(4);
     mc.pc = entry;
     true
 }
@@ -1511,6 +1698,7 @@ unsafe fn install_managed_implicit_suspend_guard(spec: &ArtThreadSpec) {
     let add = module_dlsym("libsigchain.so", "AddSpecialSignalHandlerFn");
     let ensure_front = module_dlsym("libsigchain.so", "EnsureFrontOfChain");
     let entry = libart_dlsym("art_quick_implicit_suspend") as u64;
+    let thread_current = libart_dlsym("_ZN3art6Thread7CurrentEv") as u64;
     if add.is_null() || entry == 0 {
         output_verbose(&format!(
             "[artController] implicit suspend guard 跳过: AddSpecialSignalHandlerFn={:#x}, art_quick_implicit_suspend={:#x}",
@@ -1522,6 +1710,7 @@ unsafe fn install_managed_implicit_suspend_guard(spec: &ArtThreadSpec) {
 
     IMPLICIT_SUSPEND_ENTRYPOINT.store(entry, Ordering::Relaxed);
     IMPLICIT_SUSPEND_TRIGGER_OFFSET.store(spec.suspend_trigger_offset as u64, Ordering::Relaxed);
+    IMPLICIT_SUSPEND_THREAD_CURRENT.store(thread_current, Ordering::Relaxed);
 
     let mut action: SigchainAction = std::mem::zeroed();
     action.sc_sigaction = Some(managed_implicit_suspend_sigsegv_handler);
@@ -1539,8 +1728,8 @@ unsafe fn install_managed_implicit_suspend_guard(spec: &ArtThreadSpec) {
     }
 
     output_verbose(&format!(
-        "[artController] implicit suspend guard 已安装: entry={:#x}, suspend_trigger_offset={}",
-        entry, spec.suspend_trigger_offset
+        "[artController] implicit suspend guard 已安装: entry={:#x}, thread_current={:#x}, suspend_trigger_offset={}",
+        entry, thread_current, spec.suspend_trigger_offset
     ));
 }
 
@@ -1549,8 +1738,42 @@ unsafe extern "C" fn walkstack_sigsegv_handler(
     info: *mut libc::siginfo_t,
     context: *mut libc::c_void,
 ) {
+    unsafe fn chain_prev_sigsegv(sig: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
+        let prev = &PREV_SIGSEGV_ACTION;
+        let prev_handler = prev.sa_sigaction;
+        if prev.sa_flags & libc::SA_SIGINFO != 0 {
+            let handler: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+                std::mem::transmute(prev_handler);
+            handler(sig, info, context);
+        } else if prev_handler == libc::SIG_DFL {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        } else if prev_handler != libc::SIG_IGN {
+            let simple: unsafe extern "C" fn(libc::c_int) = std::mem::transmute(prev_handler);
+            simple(sig);
+        }
+    }
+
     if try_handle_managed_implicit_suspend(sig, info, context) {
         return;
+    }
+
+    if sig == libc::SIGSEGV && !context.is_null() {
+        let uc = context as *mut libc::ucontext_t;
+        let mc = &mut (*uc).uc_mcontext;
+        let pc = mc.pc & PAC_STRIP_MASK;
+        if let Some(orig_pc) = translate_recomp_to_orig_signal_safe(pc as usize) {
+            // Let ART's real FaultManager see the original OAT PC for all
+            // implicit checks/exceptions. This preserves its native handling
+            // for suspend, null checks, stack overflow, etc., while avoiding
+            // recomp PCs in stack-map calculations.
+            mc.pc = orig_pc as u64;
+            chain_prev_sigsegv(sig, info, context);
+            if mc.pc == orig_pc as u64 {
+                mc.pc = pc;
+            }
+            return;
+        }
     }
 
     if !info.is_null() && !context.is_null() {
@@ -1570,19 +1793,7 @@ unsafe extern "C" fn walkstack_sigsegv_handler(
     }
 
     // 不是我们关心的场景 → chain 到旧 handler
-    let prev = &PREV_SIGSEGV_ACTION;
-    let prev_handler = prev.sa_sigaction;
-    if prev.sa_flags & libc::SA_SIGINFO != 0 {
-        let handler: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
-            std::mem::transmute(prev_handler);
-        handler(sig, info, context);
-    } else if prev_handler == libc::SIG_DFL {
-        libc::signal(sig, libc::SIG_DFL);
-        libc::raise(sig);
-    } else if prev_handler != libc::SIG_IGN {
-        let simple: unsafe extern "C" fn(libc::c_int) = std::mem::transmute(prev_handler);
-        simple(sig);
-    }
+    chain_prev_sigsegv(sig, info, context);
 }
 
 unsafe fn install_walkstack_sigsegv_guard() {
@@ -1595,7 +1806,7 @@ unsafe fn install_walkstack_sigsegv_guard() {
     sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
     libc::sigemptyset(&mut sa.sa_mask);
 
-    let ret = libc::sigaction(libc::SIGSEGV, &sa, &mut PREV_SIGSEGV_ACTION);
+    let ret = bionic_sigaction(libc::SIGSEGV, &sa, &mut PREV_SIGSEGV_ACTION);
     if ret == 0 {
         output_verbose("[artController] WalkStack SIGSEGV guard 已安装");
     } else {
@@ -1609,7 +1820,7 @@ unsafe fn install_walkstack_sigsegv_guard() {
 
 pub(crate) unsafe fn refresh_walkstack_sigsegv_guard() {
     let mut current: libc::sigaction = std::mem::zeroed();
-    if libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut current) != 0 {
+    if bionic_sigaction(libc::SIGSEGV, std::ptr::null(), &mut current) != 0 {
         return;
     }
     if current.sa_sigaction == walkstack_sigsegv_handler as usize {
@@ -1622,7 +1833,7 @@ pub(crate) unsafe fn refresh_walkstack_sigsegv_guard() {
     libc::sigemptyset(&mut sa.sa_mask);
 
     let mut previous: libc::sigaction = std::mem::zeroed();
-    if libc::sigaction(libc::SIGSEGV, &sa, &mut previous) == 0 {
+    if bionic_sigaction(libc::SIGSEGV, &sa, &mut previous) == 0 {
         PREV_SIGSEGV_ACTION = previous;
         WALKSTACK_GUARD_INSTALLED.store(true, Ordering::SeqCst);
     }
@@ -1672,10 +1883,27 @@ pub fn cut_art_controller_routing_hooks() {
         targets.len()
     ));
 
-    for (_label, addr) in &targets {
+    for (label, addr) in &targets {
         unsafe {
-            hook_ffi::hook_remove(*addr as *mut std::ffi::c_void);
+            remove_art_controller_hook(label, *addr);
         }
+    }
+}
+
+unsafe fn remove_art_controller_hook(label: &str, addr: u64) {
+    let reverted = crate::recomp::try_revert_slot_patch_by_slot(addr as usize);
+    if reverted {
+        output_verbose(&format!(
+            "[artController] {} reverted recomp slot branch for target={:#x}",
+            label, addr
+        ));
+    }
+    let ret = hook_ffi::hook_remove(addr as *mut std::ffi::c_void);
+    if ret != 0 {
+        output_verbose(&format!(
+            "[artController] {} hook_remove failed target={:#x} ret={}",
+            label, addr, ret
+        ));
     }
 }
 
@@ -1706,9 +1934,9 @@ pub fn cut_art_controller_walkstack_guards() {
             "[artController] cut walkstack guards: {} 个 hook_remove",
             targets.len()
         ));
-        for (_label, addr) in &targets {
+        for (label, addr) in &targets {
             unsafe {
-                hook_ffi::hook_remove(*addr as *mut std::ffi::c_void);
+                remove_art_controller_hook(label, *addr);
             }
         }
     }

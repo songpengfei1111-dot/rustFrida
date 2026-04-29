@@ -70,6 +70,7 @@ void hook_log(const char* fmt, ...);
  * cleanup drain 轮询 g_thunk_in_flight==0 即可安全 munmap pool。 */
 void emit_thunk_inflight_inc(Arm64Writer* w);
 void emit_thunk_inflight_dec(Arm64Writer* w);
+void emit_thunk_inflight_dec_regs(Arm64Writer* w, Arm64Reg addr_reg, Arm64Reg val_reg);
 
 /* 同步 munmap 所有 pool。仅在 drain 到 0 后由 orchestrator 调用（无 in-flight）。
  * drain 失败路径不应调用，让 pool 泄漏到进程退出。 */

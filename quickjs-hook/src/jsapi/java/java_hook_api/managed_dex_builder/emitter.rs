@@ -634,8 +634,7 @@ fn emit_new_object(
 ) -> Result<MethodRef, String> {
     let new_type = java_class_to_descriptor(class_name)?;
     let arg_types = infer_value_descriptors(args, layout, dsl_ctx)?;
-    let (params, full_sig) =
-        resolve_constructor_proto_with_arg_types(dsl_ctx.env, class_name, ctor_sig, &arg_types)?;
+    let (params, full_sig) = resolve_constructor_proto_with_arg_types(dsl_ctx.env, class_name, ctor_sig, &arg_types)?;
     if params.len() != args.len() {
         return Err(format!(
             "{}.<init>{} expects {} explicit args, got {}",
@@ -679,8 +678,7 @@ fn emit_new_object_value(
         ));
     }
     let arg_types = infer_value_descriptors(args, layout, dsl_ctx)?;
-    let (params, full_sig) =
-        resolve_constructor_proto_with_arg_types(dsl_ctx.env, class_name, ctor_sig, &arg_types)?;
+    let (params, full_sig) = resolve_constructor_proto_with_arg_types(dsl_ctx.env, class_name, ctor_sig, &arg_types)?;
     if params.len() != args.len() {
         return Err(format!(
             "{}.<init>{} expects {} explicit args, got {}",

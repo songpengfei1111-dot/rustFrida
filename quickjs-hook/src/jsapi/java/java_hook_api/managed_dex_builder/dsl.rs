@@ -136,10 +136,9 @@ mod tests {
 
     #[test]
     fn expression_v2_parses_parenthesized_value_ternary() {
-        let program = parse_managed_dsl(
-            "let selected: java.lang.Object = (arg0 != null ? arg0 : arg1); return selected;",
-        )
-        .unwrap();
+        let program =
+            parse_managed_dsl("let selected: java.lang.Object = (arg0 != null ? arg0 : arg1); return selected;")
+                .unwrap();
         assert_eq!(program.stmts.len(), 2);
     }
 

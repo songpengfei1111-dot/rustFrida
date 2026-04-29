@@ -68,7 +68,7 @@ use crate::jsapi::util::add_cfunction_to_object;
 use crate::value::JSValue;
 
 use crate::jsapi::hook_api::StealthMode;
-use art_controller::{set_stealth_mode, stealth_mode};
+use art_controller::{art_controller_initialized, set_stealth_mode, stealth_mode};
 use art_method::{resolve_art_method, try_invalidate_jit_cache};
 use callback::*;
 use java_choose_api::*;
@@ -712,6 +712,12 @@ unsafe extern "C" fn js_java_set_stealth(
             }
         }
     };
+    if art_controller_initialized() && mode != stealth_mode() {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Java.setStealth() must be called before ART hooks are installed; use host pre-stealth/script pre-scan so all install paths use one mode\0".as_ptr() as *const _,
+        );
+    }
     set_stealth_mode(mode);
     ffi::JS_NewBigUint64(ctx, mode as u64)
 }
@@ -957,6 +963,20 @@ pub fn pre_init_art_controller() -> Result<(), String> {
         art_controller::ensure_art_controller_initialized(&bridge, ep_offset, env as *mut std::ffi::c_void);
     }
     Ok(())
+}
+
+/// Host-side preconfiguration used before spawn-time ART initialization.
+pub fn set_host_stealth_mode(mode: i64) -> Result<u8, String> {
+    let mode = StealthMode::from_js_arg(mode);
+    if art_controller_initialized() && mode != stealth_mode() {
+        return Err(format!(
+            "Java stealth mode already locked by installed ART hooks: current={}, requested={}",
+            stealth_mode() as u8,
+            mode as u8
+        ));
+    }
+    set_stealth_mode(mode);
+    Ok(mode as u8)
 }
 
 /// Register Java API: hook/unhook (C-level) + _methods, then eval boot script
@@ -1236,7 +1256,7 @@ pub fn cut_java_hooks() {
 /// 诊断走 `output_message` 保证始终可见（不依赖 VERBOSE 开关）。
 pub fn drain_thunk_in_flight() -> bool {
     use crate::jsapi::console::output_message;
-    // 无限等待 — 必须归零才能安全 munmap pool。
+    // 无限等待 — callback 归零后可释放 JS 资源；exec 归零后才可 munmap pool/recomp。
     // Phase 1 已 cut 全部 routing 入口，counter 只减不增。若线程 parked 在 hooked 深处
     // (Looper.pollOnce / JNI monitor 等)，等它醒。用户侧 Ctrl-C 可强制中断 rustfrida CLI,
     // 但 agent 仍应尝试真正归零; 这是 "完整卸载不 leak" 的前提。
@@ -1244,13 +1264,19 @@ pub fn drain_thunk_in_flight() -> bool {
     // 每 5s 打印一次 counter 值诊断卡在哪。返回值始终 true — 调用方 unconditional
     // 走 Phase 3/4.
     let start = std::time::Instant::now();
-    let initial = in_flight_java_hook_callbacks();
-    output_message(&format!("[drain] start, thunk_in_flight={}", initial));
+    let initial_callback = in_flight_java_hook_callbacks();
+    let initial_exec = unsafe { hook_ffi::hook_thunk_in_flight_count() };
+    output_message(&format!(
+        "[drain] start, callback_in_flight={}, exec_in_flight={}",
+        initial_callback, initial_exec
+    ));
     let mut rounds = 0u32;
     loop {
-        if wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(500)) {
+        let callbacks_done = wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(500));
+        let exec_remaining = unsafe { hook_ffi::hook_thunk_in_flight_count() };
+        if callbacks_done && exec_remaining == 0 {
             output_message(&format!(
-                "[drain] done, thunk_in_flight=0 after {}ms ({} rounds)",
+                "[drain] done, callback_in_flight=0, exec_in_flight=0 after {}ms ({} rounds)",
                 start.elapsed().as_millis(),
                 rounds + 1
             ));
@@ -1258,12 +1284,14 @@ pub fn drain_thunk_in_flight() -> bool {
         }
         rounds += 1;
         if rounds % 10 == 0 {
-            let remaining = in_flight_java_hook_callbacks();
+            let callback_remaining = in_flight_java_hook_callbacks();
+            let exec_remaining = unsafe { hook_ffi::hook_thunk_in_flight_count() };
             output_message(&format!(
-                "[drain] round {}, {}ms, thunk_in_flight={} (无限等待归零)",
+                "[drain] round {}, {}ms, callback_in_flight={}, exec_in_flight={} (无限等待归零)",
                 rounds,
                 start.elapsed().as_millis(),
-                remaining
+                callback_remaining,
+                exec_remaining
             ));
         }
     }

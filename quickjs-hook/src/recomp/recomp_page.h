@@ -34,6 +34,8 @@ typedef struct {
     char error_msg[256];    /* 错误信息 */
 } RecompileStats;
 
+typedef uint64_t (*RecompTranslateExistingFn)(uint64_t orig_addr, void* user_data);
+
 /*
  * 重编译一页 ARM64 代码
  *
@@ -57,6 +59,8 @@ int recompile_page(
     uint64_t tramp_base,
     size_t tramp_cap,
     size_t* tramp_used,
+    RecompTranslateExistingFn translate_existing,
+    void* translate_user_data,
     RecompileStats* stats
 );
 

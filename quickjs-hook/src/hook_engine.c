@@ -41,10 +41,20 @@ void emit_thunk_inflight_inc(Arm64Writer* w) {
 /* 离开 thunk: atomic_dec(&g_thunk_in_flight)。x17 = ~0 = -1 → LDADDAL += -1。
  * 必须在 RET / BR 之前的最后窗口（回调、原始函数调用都已返回后）插入。 */
 void emit_thunk_inflight_dec(Arm64Writer* w) {
-    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)&g_thunk_in_flight);
-    arm64_writer_put_movn_reg_imm(w, ARM64_REG_X17, 0, 0);
-    uint32_t insn = LDADDAL_X17_XZR_X16;
+    emit_thunk_inflight_dec_regs(w, ARM64_REG_X16, ARM64_REG_X17);
+}
+
+void emit_thunk_inflight_dec_regs(Arm64Writer* w, Arm64Reg addr_reg, Arm64Reg val_reg) {
+    arm64_writer_put_ldr_reg_u64(w, addr_reg, (uint64_t)&g_thunk_in_flight);
+    arm64_writer_put_movn_reg_imm(w, val_reg, 0, 0);
+    uint32_t insn = 0xF8E0001Fu
+        | ((uint32_t)ARM64_REG_NUM(val_reg) << 16)
+        | ((uint32_t)ARM64_REG_NUM(addr_reg) << 5);
     arm64_writer_put_bytes(w, (const uint8_t*)&insn, 4);
+}
+
+uint64_t hook_thunk_in_flight_count(void) {
+    return __atomic_load_n(&g_thunk_in_flight, __ATOMIC_ACQUIRE);
 }
 
 /* 同步 munmap 所有 pool. 仅在 drain_thunk_in_flight == 0 时调用 (无 in-flight)。
@@ -64,6 +74,18 @@ void hook_engine_munmap_pools_direct(void) {
         }
     }
     g_engine.pool_count = 0;
+    for (int i = 0; i < g_retained_pool_range_count && i < MAX_EXEC_POOLS; i++) {
+        if (g_retained_pool_ranges[i].base && g_retained_pool_ranges[i].size) {
+            if (munmap((void*)(uintptr_t)g_retained_pool_ranges[i].base,
+                       (size_t)g_retained_pool_ranges[i].size) == 0) {
+                freed++;
+                bytes += g_retained_pool_ranges[i].size;
+            }
+            g_retained_pool_ranges[i].base = 0;
+            g_retained_pool_ranges[i].size = 0;
+        }
+    }
+    g_retained_pool_range_count = 0;
     if (freed > 0) {
         hook_log("munmap_pools_direct: %d pool(s), %llu bytes",
                  freed, (unsigned long long)bytes);
@@ -75,6 +97,36 @@ int hook_engine_get_pool_ranges(ExecPoolRange* out, int cap) {
     int n = g_retained_pool_range_count;
     if (n > cap) n = cap;
     for (int i = 0; i < n; i++) out[i] = g_retained_pool_ranges[i];
+    return n;
+}
+
+int hook_engine_get_exec_ranges(ExecPoolRange* out, int cap) {
+    if (!out || cap <= 0) return 0;
+    int n = 0;
+    if (g_engine.exec_mem && g_engine.exec_mem_size && n < cap) {
+        out[n].base = (uint64_t)(uintptr_t)g_engine.exec_mem;
+        out[n].size = (uint64_t)g_engine.exec_mem_size;
+        n++;
+    }
+
+    int pool_count = g_engine.pool_count;
+    if (pool_count > MAX_EXEC_POOLS) pool_count = MAX_EXEC_POOLS;
+    for (int i = 0; i < pool_count && n < cap; i++) {
+        if (g_engine.pools[i].base && g_engine.pools[i].size) {
+            out[n].base = (uint64_t)(uintptr_t)g_engine.pools[i].base;
+            out[n].size = (uint64_t)g_engine.pools[i].size;
+            n++;
+        }
+    }
+
+    int retained_count = g_retained_pool_range_count;
+    if (retained_count > MAX_EXEC_POOLS) retained_count = MAX_EXEC_POOLS;
+    for (int i = 0; i < retained_count && n < cap; i++) {
+        if (g_retained_pool_ranges[i].base && g_retained_pool_ranges[i].size) {
+            out[n] = g_retained_pool_ranges[i];
+            n++;
+        }
+    }
     return n;
 }
 

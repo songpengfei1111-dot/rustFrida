@@ -292,9 +292,24 @@ fn process_cmd(command: &str) {
             quickjs_hook::set_verbose(true);
         }
         #[cfg(feature = "quickjs")]
+        Some("javastealth") => {
+            let mode = command
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            match quickjs_loader::init_hook_runtime()
+                .and_then(|_| quickjs_hook::jsapi::java::set_host_stealth_mode(mode).map(|m| m.to_string()))
+            {
+                Ok(mode) => send_eval_ok(&format!("javastealth={}", mode)),
+                Err(e) => send_eval_err(&format!("javastealth failed: {}", e)),
+            }
+        }
+        #[cfg(feature = "quickjs")]
         Some("artinit") => {
             // 预初始化 artController Layer 1+2 (spawn 模式, 进程暂停时调用)
-            match quickjs_hook::jsapi::java::pre_init_art_controller() {
+            match quickjs_loader::init_hook_runtime().and_then(|_| quickjs_hook::jsapi::java::pre_init_art_controller())
+            {
                 Ok(_) => send_eval_ok("artinit_ok"),
                 Err(e) => send_eval_err(&format!("artinit failed: {}", e)),
             }

@@ -23,7 +23,32 @@ use std::sync::OnceLock;
 use crate::communication::{log_msg, write_stream};
 
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static HOOK_RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static HOOK_EXEC_VMA_NAME: &[u8] = b"wwb_hook_exec\0";
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExecPoolRange {
+    base: u64,
+    size: u64,
+}
+
+extern "C" {
+    fn hook_engine_get_exec_ranges(out: *mut ExecPoolRange, cap: i32) -> i32;
+}
+
+fn hook_engine_exec_ranges() -> Vec<(u64, u64)> {
+    let mut ranges = [ExecPoolRange { base: 0, size: 0 }; 128];
+    let n = unsafe { hook_engine_get_exec_ranges(ranges.as_mut_ptr(), ranges.len() as i32) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    ranges
+        .iter()
+        .take(n as usize)
+        .filter_map(|r| (r.base != 0 && r.size != 0).then_some((r.base, r.size)))
+        .collect()
+}
 
 /// 从 /proc/self/maps 找 libart.so 的 r-xp 基址（用作 mmap hint）
 fn find_libart_base() -> Option<usize> {
@@ -99,10 +124,13 @@ impl Drop for ExecMemory {
 unsafe impl Send for ExecMemory {}
 unsafe impl Sync for ExecMemory {}
 
-/// Initialize the QuickJS engine and hook system
-pub fn init() -> Result<(), String> {
-    if ENGINE_INITIALIZED.load(Ordering::SeqCst) {
-        return Err("JS 引擎已初始化".to_string());
+/// Initialize the hook engine and recomp bridge without creating a QuickJS runtime.
+///
+/// This is needed by spawn-time ART pre-initialization: Java stealth mode must be
+/// selected before any ART controller patch is installed.
+pub fn init_hook_runtime() -> Result<(), String> {
+    if HOOK_RUNTIME_INITIALIZED.load(Ordering::SeqCst) {
+        return Ok(());
     }
 
     // Allocate executable memory for hooks (64KB), near libart.so for ADRP range
@@ -115,6 +143,7 @@ pub fn init() -> Result<(), String> {
 
     // 注册 recomp handlers
     quickjs_hook::recomp::set_handler(|addr| crate::recompiler::ensure_and_translate(addr));
+    quickjs_hook::recomp::set_translate_existing_handler(|addr| crate::recompiler::translate_addr(addr).ok());
     quickjs_hook::recomp::set_alloc_slot_handler(|addr| crate::recompiler::alloc_trampoline_slot(addr));
     quickjs_hook::recomp::set_fixup_handler(|trampoline, addr| {
         crate::recompiler::fixup_slot_trampoline(trampoline, addr)
@@ -123,6 +152,23 @@ pub fn init() -> Result<(), String> {
     quickjs_hook::recomp::set_revert_handler(|addr| crate::recompiler::revert_slot_patch(addr));
     quickjs_hook::recomp::set_install_patch_handler(|addr, bytes| crate::recompiler::install_patch(addr, bytes));
     quickjs_hook::recomp::set_try_revert_handler(|addr| crate::recompiler::try_revert_slot_patch(addr));
+    quickjs_hook::recomp::set_try_revert_slot_handler(|slot| crate::recompiler::try_revert_slot_patch_by_slot(slot));
+    quickjs_hook::recomp::set_reverse_translate_handler(|addr| crate::recompiler::translate_recomp_to_orig(addr));
+    quickjs_hook::recomp::set_patch_suspend_polls_handler(|addr, entry| {
+        crate::recompiler::patch_suspend_polls(addr, entry)
+    });
+
+    HOOK_RUNTIME_INITIALIZED.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Initialize the QuickJS engine and hook system
+pub fn init() -> Result<(), String> {
+    if ENGINE_INITIALIZED.load(Ordering::SeqCst) {
+        return Err("JS 引擎已初始化".to_string());
+    }
+
+    init_hook_runtime()?;
 
     if let Some(output_path) = crate::OUTPUT_PATH.get() {
         set_qbdi_output_dir(output_path.clone());
@@ -192,8 +238,8 @@ pub fn is_initialized() -> bool {
 ///
 /// Phase 1: **切断所有 hook 入口** (Java + Native + OAT inline)。之后 g_thunk_in_flight 只减不增。
 /// Phase 2: **drain g_thunk_in_flight → 0**。归零表示无线程在 thunk 或 callee 中。
-/// Phase 3: **释放资源** (ArtMethod 堆、JNI global ref、JS callback、JS runtime、art_controller state)。
-/// Phase 4: **hook_engine cleanup + munmap pool/recomp 页**。
+/// Phase 3: **注销 recomp + 全线程 safepoint**。确认活动栈不再引用生成代码。
+/// Phase 4: **释放资源 + hook_engine cleanup + munmap pool/recomp 页**。
 pub fn cleanup() {
     use std::time::Instant;
     let t0 = Instant::now();
@@ -238,33 +284,65 @@ pub fn cleanup() {
     stage("phase2 drain_thunk_in_flight", &mut t);
 
     // ============================================================
-    // Phase 3: 释放资源 (drain 归零后才安全拆 OAT bypass)
-    //   OAT bypass 拆和 pool munmap 是原子事件 —— 一旦拆了 bypass, pool 必须立刻 munmap
-    //   (否则残留 PC 访问 pool → no bypass 保护 → WalkStack 炸)
+    // Phase 3: 停止新 recomp 执行，并等待所有线程活动栈离开 hook/recomp 地址。
+    //
+    // drain=0 只说明没有线程仍在 thunk 中执行；ART quick 栈上仍可能保留
+    // generated return PC，后续 Throwable/ANR/GC StackVisitor 还会读到它。
+    // 因此必须在拆 walkstack guards 和 munmap 前做全线程栈 safepoint。
+    // ============================================================
+    crate::recompiler::release_all();
+    stage("phase3 release_all_recomp", &mut t);
+
+    let mut protected_ranges = hook_engine_exec_ranges();
+    protected_ranges.extend(crate::recompiler::get_retained_ranges());
+    if !protected_ranges.is_empty() {
+        log_msg(format!(
+            "[quickjs] safepoint protected ranges={}\n",
+            protected_ranges.len()
+        ));
+    }
+    let stack_clean = crate::safepoint::wait_until_clean(&protected_ranges, 30_000);
+    stage("phase3 safepoint_stack_clean", &mut t);
+    if !stack_clean {
+        log_msg(
+            "[quickjs] safepoint timeout: keep walkstack guards and executable memory mapped; destructive cleanup skipped\n"
+                .to_string(),
+        );
+        return;
+    }
+
+    // ============================================================
+    // Phase 4: 释放资源 + 同步释放 pool/recomp
     // ============================================================
     cut_art_controller_walkstack_guards();
-    stage("phase3 cut_art_controller_walkstack_guards", &mut t);
+    stage("phase4 cut_art_controller_walkstack_guards", &mut t);
+    crate::recompiler::release_all();
+    stage("phase4 release_guard_recomp", &mut t);
+    let mut post_guard_ranges = hook_engine_exec_ranges();
+    post_guard_ranges.extend(crate::recompiler::get_retained_ranges());
+    let post_guard_clean = crate::safepoint::wait_until_clean(&post_guard_ranges, 30_000);
+    stage("phase4 safepoint_after_guard_cut", &mut t);
+    if !post_guard_clean {
+        log_msg(
+            "[quickjs] post-guard safepoint timeout: keep executable memory mapped; final munmap skipped\n".to_string(),
+        );
+        return;
+    }
     free_art_controller_state();
-    stage("phase3 free_art_controller_state", &mut t);
+    stage("phase4 free_art_controller_state", &mut t);
     free_java_hooks();
-    stage("phase3 free_java_hooks", &mut t);
+    stage("phase4 free_java_hooks", &mut t);
     free_native_hooks();
-    stage("phase3 free_native_hooks", &mut t);
+    stage("phase4 free_native_hooks", &mut t);
     #[cfg(feature = "qbdi")]
     {
         shutdown_qbdi_helper();
-        stage("phase3 shutdown_qbdi_helper", &mut t);
+        stage("phase4 shutdown_qbdi_helper", &mut t);
     }
     cleanup_engine();
-    stage("phase3 cleanup_engine", &mut t);
-
-    // ============================================================
-    // Phase 4: 同步释放 pool + recomp (drain 已归零, 确认无 in-flight)
-    // ============================================================
+    stage("phase4 cleanup_engine", &mut t);
     cleanup_wxshadow_patches();
     stage("phase4 cleanup_wxshadow_patches", &mut t);
-    crate::recompiler::release_all();
-    stage("phase4 release_all_recomp", &mut t);
     let (recomp_ok, recomp_fail, recomp_bytes) = unsafe { crate::recompiler::munmap_retained_ranges() };
     if recomp_ok + recomp_fail > 0 {
         log_msg(format!(
@@ -283,9 +361,7 @@ pub fn cleanup() {
     ));
 }
 
-// 注：旧的 munmap_retained_ranges_final (快照 snap → munmap) 已废弃，由
-// hook_engine_munmap_pools_direct (C 侧直读 g_engine.pools[] 同步 munmap) 取代。
-// drain 超时路径不释放 pool/recomp/walkstack guards，泄漏到进程退出。
+// 注：full cleanup 在 callback/exec 两套计数都归零后同步 munmap hook pool/recomp 页。
 
 /// **软清理**：完整 unhook + drain=0 + 销毁 runtime，保留 hook 基础设施和 RWX 内存。
 ///

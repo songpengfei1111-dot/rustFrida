@@ -334,24 +334,36 @@ unsafe fn initialize_generated_message_queue(
 unsafe fn install_orig_backup_art_method(
     backup_art_method: u64,
     original_art_method: u64,
+    art_method_size: usize,
     entry_point_offset: usize,
     original_trampoline: u64,
 ) -> Result<(), String> {
-    if backup_art_method == 0 || original_art_method == 0 || original_trampoline == 0 {
+    if backup_art_method == 0 || original_art_method == 0 || art_method_size == 0 || original_trampoline == 0 {
         return Err("invalid managed orig backup ArtMethod state".to_string());
     }
+    if entry_point_offset + std::mem::size_of::<u64>() > art_method_size {
+        return Err(format!(
+            "invalid managed orig backup ArtMethod layout: ep_offset={} size={}",
+            entry_point_offset, art_method_size
+        ));
+    }
 
+    std::ptr::copy_nonoverlapping(
+        original_art_method as *const u8,
+        backup_art_method as *mut u8,
+        art_method_size,
+    );
     std::ptr::write_volatile(
         (backup_art_method as usize + entry_point_offset) as *mut u64,
         original_trampoline,
     );
     crate::ffi::hook::hook_flush_cache(
-        (backup_art_method as usize + entry_point_offset) as *mut std::ffi::c_void,
-        8,
+        backup_art_method as *mut std::ffi::c_void,
+        art_method_size,
     );
     output_message(&format!(
-        "[managedHook] installed orig backup entry ArtMethod={:#x} source={:#x} entry={:#x}",
-        backup_art_method, original_art_method, original_trampoline
+        "[managedHook] installed orig backup ArtMethod clone={:#x} source={:#x} size={} entry={:#x}",
+        backup_art_method, original_art_method, art_method_size, original_trampoline
     ));
     Ok(())
 }
@@ -471,8 +483,13 @@ unsafe fn install_managed_method_helper(
     }
     let helper_entry_point = read_entry_point(helper_art_method, helper_spec.entry_point_offset);
     if let Some(backup_art_method) = orig_backup_art_method {
-        install_orig_backup_art_method(backup_art_method, art_method, ep_offset, original_entry_point)?;
+        install_orig_backup_art_method(backup_art_method, art_method, spec.size, ep_offset, original_entry_point)?;
     }
+    let orig_bypass_art_method = if uses_orig {
+        orig_backup_art_method.unwrap_or(art_method)
+    } else {
+        art_method
+    };
     let class_global_ref = create_class_global_ref(env, class_name)?;
     let mut install_guard = JavaHookInstallGuard::new(
         art_method,
@@ -489,60 +506,31 @@ unsafe fn install_managed_method_helper(
     update_original_method_flags_for_hook(art_method, spec.access_flags_offset, original_access_flags);
     install_guard.set_original_method_mutated();
 
-    let (per_method_hook_target, quick_trampoline) = if uses_orig {
-        let mut resolved_target: *mut std::ffi::c_void = std::ptr::null_mut();
-        let managed_entry = crate::ffi::hook::hook_install_managed_direct_entrypoint(
-            original_entry_point as *mut std::ffi::c_void,
-            env as *mut std::ffi::c_void,
-            &mut resolved_target,
-            helper_art_method,
-            helper_entry_point,
-            art_method,
-            0,
-        );
-        if managed_entry.is_null() {
-            delete_local_ref(env, helper_cls);
-            return Err("hook_install_managed_direct_entrypoint failed".to_string());
-        }
-        let backup_entry = if !resolved_target.is_null() {
-            resolved_target as u64
-        } else {
-            original_entry_point
-        };
-        std::ptr::write_volatile((art_method as usize + ep_offset) as *mut u64, managed_entry as u64);
-        crate::ffi::hook::hook_flush_cache((art_method as usize + ep_offset) as *mut std::ffi::c_void, 8);
-        output_message(&format!(
-            "[managedHook] installed entrypoint managed thunk original={:#x} entry={:#x} backup_entry={:#x}",
-            art_method, managed_entry as u64, backup_entry
-        ));
-        (None, backup_entry)
+    let (hook_addr, stealth_flag) =
+        super::super::art_controller::prepare_hook_target(original_entry_point, env as *mut std::ffi::c_void)
+            .map_err(|e| format!("prepare_hook_target: {}", e))?;
+    let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
+    let quick_trampoline = crate::ffi::hook::hook_install_managed_direct_router(
+        hook_addr as *mut std::ffi::c_void,
+        stealth_flag,
+        env as *mut std::ffi::c_void,
+        &mut hooked_target,
+        helper_art_method,
+        helper_entry_point,
+        orig_bypass_art_method,
+        if uses_orig { 1 } else { 0 },
+    );
+    if quick_trampoline.is_null() {
+        delete_local_ref(env, helper_cls);
+        return Err("hook_install_managed_direct_router failed".to_string());
+    }
+    super::super::art_controller::try_fixup_trampoline_pub(quick_trampoline, original_entry_point);
+    let per_method_hook_target = if !hooked_target.is_null() {
+        Some(hooked_target as u64)
     } else {
-        let (hook_addr, stealth_flag) =
-            super::super::art_controller::prepare_hook_target(original_entry_point, env as *mut std::ffi::c_void)
-                .map_err(|e| format!("prepare_hook_target: {}", e))?;
-        let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
-        let quick_trampoline = crate::ffi::hook::hook_install_managed_direct_router(
-            hook_addr as *mut std::ffi::c_void,
-            stealth_flag,
-            env as *mut std::ffi::c_void,
-            &mut hooked_target,
-            helper_art_method,
-            helper_entry_point,
-            art_method,
-            if uses_orig { 1 } else { 0 },
-        );
-        if quick_trampoline.is_null() {
-            delete_local_ref(env, helper_cls);
-            return Err("hook_install_managed_direct_router failed".to_string());
-        }
-        super::super::art_controller::try_fixup_trampoline_pub(quick_trampoline, original_entry_point);
-        let per_method_hook_target = if !hooked_target.is_null() {
-            Some(hooked_target as u64)
-        } else {
-            Some(original_entry_point)
-        };
-        (per_method_hook_target, quick_trampoline as u64)
+        Some(hook_addr)
     };
+    let quick_trampoline = quick_trampoline as u64;
     delete_local_ref(env, helper_cls);
     let use_blr = false;
 

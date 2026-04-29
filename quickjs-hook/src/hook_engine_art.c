@@ -324,7 +324,6 @@ void hook_art_router_get_route_stats(uint64_t* quick_hits,
 #define ART_SAVE_EVERYTHING_OLD_TOP_OFF 8
 #define QUICK_PREORIG_RET_REG 16
 #define ART_THREAD_STATE_AND_FLAGS_OFF 0
-#define ART_QUICK_SUSPEND_POLL_FLAGS 0x3f
 
 /* TPIDR_EL0 system register encoding */
 #define SYSREG_TPIDR_EL0 0xDE82
@@ -365,6 +364,7 @@ static void emit_art_router_fast_bypass(Arm64Writer* w, uint64_t lbl_normal) {
         emit_atomic_inc64(w, &g_orig_bypass_hit);
         arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&slot->thread);
         arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 16); /* trampoline */
+        emit_thunk_inflight_dec_regs(w, ARM64_REG_X14, ARM64_REG_X15);
         arm64_writer_put_br_reg(w, ARM64_REG_X16);
         arm64_writer_put_label(w, lbl_next);
     }
@@ -689,6 +689,7 @@ extern uint64_t art_quick_top_quick_frame_offset(void);
 static void emit_restore_args_only(Arm64Writer* w);
 static void emit_save_args_only(Arm64Writer* w);
 static void emit_restore_quick_callee_without_lr(Arm64Writer* w);
+static void emit_art_router_call_original_and_return(Arm64Writer* w, uint64_t trampoline_target);
 static void emit_art_router_inc_counter(Arm64Writer* w, volatile uint64_t* counter);
 static int resolve_art_callee_save_frame_params(uint64_t* method_out, uint64_t* top_quick_off_out);
 static int emit_art_quick_callee_save_frame_push(Arm64Writer* w);
@@ -713,8 +714,20 @@ static int resolve_art_quick_test_suspend_entrypoint(uint64_t* entrypoint_out) {
     return 1;
 }
 
-static void emit_art_quick_test_suspend_poll(Arm64Writer* w) {
+static void emit_art_quick_test_suspend_poll_ex(Arm64Writer* w, int preserve_router_regs) {
     (void)w;
+    (void)preserve_router_regs;
+    /* Do not call art_quick_test_suspend from hook-pool code. That entrypoint
+     * installs a SaveEverythingForSuspendCheck frame and ART stack walkers then
+     * expect the caller PC to belong to valid quick code with an OAT stack map.
+     * A hook-pool caller has no such metadata, so GC/checkpoint stack walking
+     * can crash while resolving the synthetic caller frame. Suspend/checkpoint
+     * requests are instead handled after we tail-call back into real managed
+     * code or while executing recompiled original quick code. */
+}
+
+static void emit_art_quick_test_suspend_poll(Arm64Writer* w) {
+    emit_art_quick_test_suspend_poll_ex(w, 1);
 }
 
 static int resolve_art_callee_save_frame_params(uint64_t* method_out, uint64_t* top_quick_off_out) {
@@ -930,16 +943,12 @@ static void emit_art_router_quick_callback_path(Arm64Writer* w, uint64_t lbl_qui
     arm64_writer_put_cbnz_reg_label(w, ARM64_REG_X0, lbl_return_replacement);
 
     arm64_writer_put_label(w, lbl_call_original);
-    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X20, ARM64_REG_SP, ROUTER_FRAME_PADDING_OFF);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 0);
-    emit_restore_args_only(w);
-    emit_art_quick_test_suspend_poll(w);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X20, ARM64_REG_SP, ROUTER_FRAME_PADDING_OFF);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X20, 0);
+    /* Keep the ART-visible stack method as the native sentinel while the real
+     * original quick code runs. The real ArtMethod is passed in x0 only. */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X20, 8);
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
-    emit_art_router_restore_all(w);
-    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, trampoline_target);
-    arm64_writer_put_br_reg(w, ARM64_REG_X16);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 0);
+    emit_art_router_call_original_and_return(w, trampoline_target);
 
     arm64_writer_put_label(w, lbl_preorig_callback);
     /* ART quick code is not a C callee for our router. Do not keep router
@@ -1021,6 +1030,7 @@ static void emit_art_router_quick_callback_path(Arm64Writer* w, uint64_t lbl_qui
     arm64_writer_put_fp_ldp_offset(w, 0, 1, ARM64_REG_X22, 280);
     arm64_writer_put_fp_stp_offset(w, 0, 1, ARM64_REG_SP, ROUTER_FRAME_FP_OFF);
     emit_art_router_restore_all_with_return_x0(w, ARM64_REG_X16);
+    emit_thunk_inflight_dec(w);
     arm64_writer_put_ret(w);
 }
 
@@ -1104,6 +1114,7 @@ static void emit_art_router_found_path(Arm64Writer* w, uint64_t lbl_found,
 
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, quickcode_offset);
     emit_art_router_restore_all_with_return_x0(w, ARM64_REG_X17);
+    emit_thunk_inflight_dec_regs(w, ARM64_REG_X14, ARM64_REG_X15);
     arm64_writer_put_br_reg(w, ARM64_REG_X16);
 
     arm64_writer_put_label(w, lbl_replacement_loaded);
@@ -1155,6 +1166,7 @@ static void emit_art_router_found_path(Arm64Writer* w, uint64_t lbl_found,
     /* Restore all regs — X0 now holds replacement ArtMethod*
      * (dec 在 restore_all 尾部) */
     emit_art_router_restore_all(w);
+    emit_thunk_inflight_dec(w);
 
     /* Load replacement.entry_point_ (= jni_trampoline) 到 x16, BR 出 thunk */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X0, quickcode_offset);
@@ -1169,9 +1181,8 @@ static void emit_art_router_not_found_path(Arm64Writer* w, uint64_t lbl_not_foun
                                             uint64_t fallback_target) {
     arm64_writer_put_label(w, lbl_not_found);
     emit_art_router_debug_counters(w);
-    /* 恢复全部寄存器（含原始 x0, dec 在 restore_all 尾部） */
     emit_art_router_restore_all(w);
-    /* Jump to fallback target (relocated original or trampoline) */
+    emit_thunk_inflight_dec(w);
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, fallback_target);
     arm64_writer_put_br_reg(w, ARM64_REG_X16);
 }
@@ -1230,6 +1241,27 @@ static void emit_restore_callee_and_pop(Arm64Writer* w) {
     arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP, 192, ARM64_INDEX_SIGNED_OFFSET);
     arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_LR, ARM64_REG_SP, 208, ARM64_INDEX_SIGNED_OFFSET);
     arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ROUTER_FRAME_SIZE);
+}
+
+/* Call the relocated original while keeping the router frame alive, then
+ * return to the Java caller only after the original method has returned.
+ *
+ * This is intentionally different from the fast $orig bypass, which tail-calls
+ * the original and never comes back. For fallback/slow-orig paths that do come
+ * through our router, keep exec_in_flight held across the original execution so
+ * cleanup cannot munmap router/recomp memory while ART can still return here.
+ *
+ * The caller must put a stack-walk-safe native sentinel in SP+0 and the real
+ * original ArtMethod in X0 before this helper is emitted. */
+static void emit_art_router_call_original_and_return(Arm64Writer* w, uint64_t trampoline_target) {
+    emit_restore_args_only(w);
+    emit_art_quick_test_suspend_poll(w);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, trampoline_target);
+    emit_restore_quick_callee_without_lr(w);
+    arm64_writer_put_blr_reg(w, ARM64_REG_X16);
+    emit_restore_callee_and_pop(w);
+    emit_thunk_inflight_dec(w);
+    arm64_writer_put_ret(w);
 }
 
 /* BLR variant of found path for Layer 3 per-method thunks.
@@ -1356,6 +1388,7 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
     emit_restore_callee_and_pop(w);
 
     /* BR trampoline → original method → RET to caller */
+    emit_thunk_inflight_dec_regs(w, ARM64_REG_X14, ARM64_REG_X15);
     arm64_writer_put_br_reg(w, ARM64_REG_X16);
 
     /* === no_orig: return callback value === */
@@ -1373,6 +1406,7 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_X16);
 
     /* RET to caller */
+    emit_thunk_inflight_dec(w);
     arm64_writer_put_ret(w);
 }
 
@@ -1518,6 +1552,7 @@ static size_t generate_art_router_thunk(void* thunk_mem, size_t thunk_alloc,
     /* Fast $orig bypass — checked BEFORE prologue (zero register save overhead).
      * This handles the JNI-path $orig re-entry (orig_bypass_set from Rust). */
     uint64_t lbl_normal_path = arm64_writer_new_label_id(&w);
+    emit_thunk_inflight_inc(&w);
     emit_art_router_fast_bypass(&w, lbl_normal_path);
     arm64_writer_put_label(&w, lbl_normal_path);
 
@@ -1661,6 +1696,8 @@ static size_t generate_managed_direct_thunk(void* thunk_mem, size_t thunk_alloc,
     arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, thunk_alloc);
 
     uint64_t lbl_normal_path = arm64_writer_new_label_id(&w);
+    emit_thunk_inflight_inc(&w);
+    emit_art_quick_test_suspend_poll_ex(&w, 0);
     emit_art_router_fast_bypass(&w, lbl_normal_path);
     arm64_writer_put_label(&w, lbl_normal_path);
 
@@ -1675,6 +1712,7 @@ static size_t generate_managed_direct_thunk(void* thunk_mem, size_t thunk_alloc,
     /* Tail-call the generated managed helper. Keeping LR unchanged makes the
      * helper return to the original Java caller, so no hook-pool return PC is
      * exposed to ART stack walking during allocation/GC. */
+    emit_thunk_inflight_dec_regs(&w, ARM64_REG_X14, ARM64_REG_X15);
     arm64_writer_put_br_reg(&w, ARM64_REG_X16);
 
     if (arm64_writer_flush(&w) != 0) {
@@ -1949,6 +1987,7 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
 
     /* Fast $orig bypass */
     uint64_t lbl_normal_path = arm64_writer_new_label_id(&w);
+    emit_thunk_inflight_inc(&w);
     emit_art_router_fast_bypass(&w, lbl_normal_path);
     arm64_writer_put_label(&w, lbl_normal_path);
 

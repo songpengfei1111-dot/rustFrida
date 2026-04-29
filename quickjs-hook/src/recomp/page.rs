@@ -3,21 +3,33 @@
 use std::sync::Mutex;
 
 type RecompHandler = fn(usize) -> Result<usize, String>;
+type RecompTranslateExistingHandler = fn(usize) -> Option<usize>;
 type RecompAllocSlotHandler = fn(usize) -> Result<usize, String>;
 type RecompFixupHandler = fn(*mut u8, usize) -> Result<(), String>;
 type RecompCommitHandler = fn(usize) -> Result<(), String>;
 type RecompInstallPatchHandler = fn(usize, &[u8]) -> Result<(), String>;
 type RecompTryRevertHandler = fn(usize) -> bool;
+type RecompTryRevertSlotHandler = fn(usize) -> bool;
+type RecompReverseTranslateHandler = fn(usize) -> Option<usize>;
+type RecompPatchSuspendPollsHandler = fn(usize, usize) -> Result<(), String>;
 
 static HANDLER: Mutex<Option<RecompHandler>> = Mutex::new(None);
+static TRANSLATE_EXISTING_HANDLER: Mutex<Option<RecompTranslateExistingHandler>> = Mutex::new(None);
 static ALLOC_SLOT_HANDLER: Mutex<Option<RecompAllocSlotHandler>> = Mutex::new(None);
 static FIXUP_HANDLER: Mutex<Option<RecompFixupHandler>> = Mutex::new(None);
 static COMMIT_HANDLER: Mutex<Option<RecompCommitHandler>> = Mutex::new(None);
 static INSTALL_PATCH_HANDLER: Mutex<Option<RecompInstallPatchHandler>> = Mutex::new(None);
 static TRY_REVERT_HANDLER: Mutex<Option<RecompTryRevertHandler>> = Mutex::new(None);
+static TRY_REVERT_SLOT_HANDLER: Mutex<Option<RecompTryRevertSlotHandler>> = Mutex::new(None);
+static REVERSE_TRANSLATE_HANDLER: Mutex<Option<RecompReverseTranslateHandler>> = Mutex::new(None);
+static PATCH_SUSPEND_POLLS_HANDLER: Mutex<Option<RecompPatchSuspendPollsHandler>> = Mutex::new(None);
 
 pub fn set_handler(handler: RecompHandler) {
     *HANDLER.lock().unwrap() = Some(handler);
+}
+
+pub fn set_translate_existing_handler(handler: RecompTranslateExistingHandler) {
+    *TRANSLATE_EXISTING_HANDLER.lock().unwrap() = Some(handler);
 }
 
 pub fn set_alloc_slot_handler(handler: RecompAllocSlotHandler) {
@@ -40,6 +52,37 @@ pub fn set_try_revert_handler(handler: RecompTryRevertHandler) {
     *TRY_REVERT_HANDLER.lock().unwrap() = Some(handler);
 }
 
+pub fn set_try_revert_slot_handler(handler: RecompTryRevertSlotHandler) {
+    *TRY_REVERT_SLOT_HANDLER.lock().unwrap() = Some(handler);
+}
+
+pub fn set_reverse_translate_handler(handler: RecompReverseTranslateHandler) {
+    *REVERSE_TRANSLATE_HANDLER.lock().unwrap() = Some(handler);
+}
+
+pub fn set_patch_suspend_polls_handler(handler: RecompPatchSuspendPollsHandler) {
+    *PATCH_SUSPEND_POLLS_HANDLER.lock().unwrap() = Some(handler);
+}
+
+pub fn translate_recomp_to_orig(addr: usize) -> Option<usize> {
+    let guard = REVERSE_TRANSLATE_HANDLER.lock().unwrap();
+    guard.as_ref().and_then(|handler| handler(addr))
+}
+
+pub fn translate_existing(addr: usize) -> Option<usize> {
+    let guard = TRANSLATE_EXISTING_HANDLER.lock().unwrap();
+    guard.as_ref().and_then(|handler| handler(addr))
+}
+
+pub fn patch_suspend_polls(orig_addr: usize, implicit_suspend_entry: usize) -> Result<(), String> {
+    let guard = PATCH_SUSPEND_POLLS_HANDLER.lock().unwrap();
+    let handler = match guard.as_ref() {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+    handler(orig_addr, implicit_suspend_entry)
+}
+
 /// 安装 stealth-2 用户 patch：把 bytes relocate 到 recomp 跳板区 slot,
 /// 原子在 recomp 页对应位置写 B→slot, 取指命中 patch。
 pub fn install_patch(orig_addr: usize, bytes: &[u8]) -> Result<(), String> {
@@ -57,6 +100,14 @@ pub fn try_revert_slot_patch(orig_addr: usize) -> bool {
     let guard = TRY_REVERT_HANDLER.lock().unwrap();
     match guard.as_ref() {
         Some(h) => h(orig_addr),
+        None => false,
+    }
+}
+
+pub fn try_revert_slot_patch_by_slot(slot_addr: usize) -> bool {
+    let guard = TRY_REVERT_SLOT_HANDLER.lock().unwrap();
+    match guard.as_ref() {
+        Some(h) => h(slot_addr),
         None => false,
     }
 }

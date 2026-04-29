@@ -405,8 +405,7 @@ fn resolve_constructor_proto_with_arg_types(
         sig: String::new(),
         args: Vec::new(),
     };
-    let (params, return_type, full_sig) =
-        resolve_direct_call_proto(env, &stmt, class_name, false, arg_types)?;
+    let (params, return_type, full_sig) = resolve_direct_call_proto(env, &stmt, class_name, false, arg_types)?;
     if return_type != "V" {
         return Err(format!("constructor signature must return void, got '{}'", return_type));
     }

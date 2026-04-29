@@ -164,6 +164,10 @@ typedef struct {
  */
 int hook_engine_get_pool_ranges(ExecPoolRange* out, int cap);
 
+/* 读取当前仍可能出现在 ART 栈上的 hook engine 可执行范围：
+ * 初始 exec_mem + 当前扩展 pool + cleanup 后 retained pool。 */
+int hook_engine_get_exec_ranges(ExecPoolRange* out, int cap);
+
 /* 清空快照（Rust 在 munmap 完成后调用，防止跨次 cleanup 误认） */
 void hook_engine_clear_pool_ranges(void);
 
@@ -181,6 +185,7 @@ int hook_is_in_exec_pool(uint64_t pc);
  *   3. 若归零：Rust 调 hook_engine_munmap_pools_direct 同步清
  *   4. 若超时：放弃同步清，pool/walkstack guards 泄漏到进程退出 */
 extern volatile uint64_t g_thunk_in_flight;
+uint64_t hook_thunk_in_flight_count(void);
 
 /* 同步 munmap 所有扩展 pool。仅在 g_thunk_in_flight == 0 时调用才安全。
  * drain 超时不应调用此函数，让 pool 泄漏到进程退出。 */
@@ -628,11 +633,14 @@ int hook_restore_inlined_oat_header_patches(void);
  * 返回 recomp 地址 (>0) 表示成功，0 表示失败。
  */
 typedef uintptr_t (*recomp_translate_fn)(uintptr_t orig_addr);
+typedef uintptr_t (*recomp_reverse_translate_fn)(uintptr_t recomp_addr);
 
 /*
  * 注册 recomp 翻译回调。设置后，oat_patch 等写入会在 recomp 页上操作。
  */
 void hook_set_recomp_translate(recomp_translate_fn fn);
+void hook_set_recomp_existing_translate(recomp_translate_fn fn);
+void hook_set_recomp_reverse_translate(recomp_reverse_translate_fn fn);
 
 /*
  * 设置 OAT patch 的 stealth 模式: 0=normal(mprotect), 1=wxshadow, 2=recomp
