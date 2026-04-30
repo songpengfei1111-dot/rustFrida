@@ -101,6 +101,176 @@ exit                # 退出
 
 ---
 
+## 快速上手
+
+最常见的工作流是：写一个 `script.js`，用 `-l` 加载到目标进程，然后通过日志、RPC 或文件把结果带出来。
+
+```bash
+# 已运行的进程
+./rustfrida --pid <pid> -l script.js
+
+# 从启动阶段注入，适合抓 Application / ClassLoader 初始化
+./rustfrida --spawn com.example.app -l script.js
+
+# 先进入交互，再手动 loadjs / jseval
+./rustfrida --pid <pid>
+```
+
+最小脚本：
+
+```js
+console.log("agent loaded");
+
+Java.ready(function() {
+    console.log("Java is ready");
+});
+```
+
+### 能力地图
+
+| 你想做什么 | 优先使用 | 典型入口 |
+| --- | --- | --- |
+| Hook Java 方法、改参数/返回值 | `Java.use()` | `Class.method.impl = function (...) { ... }` |
+| 高频 Java 方法 Hook | Managed DSL 动态编译器 | `method.dslImpl = script` |
+| Hook native 函数并继续跑原函数 | `Interceptor.attach` | `onEnter(args)` / `onLeave(retval)` |
+| 完全替换 native 函数 | `hook()` 或 `Interceptor.replace()` | `this.orig(...)` / `return value` |
+| 查找 so、符号、导入导出 | `Module` | `findExportByName()` / `enumerateSymbols()` |
+| 读写目标进程内存 | `Memory` / `ptr()` | `p.readU32()` / `p.writeBytes()` |
+| 监控 JNI 注册 | `Jni` + native hook | `Jni.addr("RegisterNatives")` |
+| 远程触发脚本能力 | HTTP RPC | `rpc.exports = { ... }` |
+| 采集指令 trace 用于回放分析 | `qbdi` | `registerTraceCallbacks()` |
+
+### 常见场景
+
+#### Hook Java 方法
+
+适合看业务参数、绕过判断、替换返回值。Spawn 模式下务必放在 `Java.ready()` 里。
+
+```js
+Java.ready(function() {
+    var Login = Java.use("com.example.LoginManager");
+
+    Login.checkPassword.impl = function(user, pass) {
+        console.log("checkPassword", user, pass);
+        return true;              // 直接改返回值，不调原方法
+    };
+});
+```
+
+需要保留原逻辑时调用 `$orig()`：
+
+```js
+Java.ready(function() {
+    var Log = Java.use("android.util.Log");
+
+    Log.i.overload("java.lang.String", "java.lang.String").impl = function(tag, msg) {
+        console.log("[Log.i]", tag, msg);
+        return this.$orig(tag, msg);
+    };
+});
+```
+
+#### Hook Native 函数并修改参数
+
+只改参数然后继续执行原函数，优先用 `Interceptor.attach({ onEnter })`。
+
+```js
+var open = Module.findExportByName("libc.so", "open");
+
+Interceptor.attach(open, {
+    onEnter(args) {
+        var path = args[0].readCString();
+        console.log("open", path);
+
+        if (path.indexOf("/proc/self/maps") >= 0) {
+            args[0] = Memory.allocUtf8String("/data/local/tmp/fake_maps");
+        }
+    }
+});
+```
+
+#### Hook Native 函数并修改返回值
+
+需要返回值时加 `onLeave`。
+
+```js
+var getuid = Module.findExportByName("libc.so", "getuid");
+
+Interceptor.attach(getuid, {
+    onLeave(retval) {
+        console.log("getuid =>", retval.toUInt32());
+        retval.replace(0);
+    }
+});
+```
+
+#### 条件性调用原 native 函数
+
+如果你需要“有时调原函数、有时直接返回”，用 `hook()` 更直接。
+
+```js
+var getpid = Module.findExportByName("libc.so", "getpid");
+
+hook(getpid, function() {
+    var real = this.orig();
+    console.log("real pid =", real);
+    return 12345;
+});
+```
+
+#### 监控 RegisterNatives
+
+适合定位 Java native 方法和 so 内真实函数地址。
+
+```js
+hook(Jni.addr("RegisterNatives"), function(env, clazz, methodsPtr, count) {
+    var cls = Jni.env.getClassName(clazz);
+    var methods = Jni.structs.JNINativeMethod.readArray(ptr(methodsPtr), Number(count));
+
+    console.log("RegisterNatives:", cls);
+    methods.forEach(function(m) {
+        var mod = Module.findByAddress(m.fnPtr);
+        var where = mod ? mod.name + "+" + m.fnPtr.sub(mod.base) : m.fnPtr.toString();
+        console.log("  " + m.name + " " + m.sig + " -> " + where);
+    });
+
+    return this.orig();
+});
+```
+
+#### 远程调用脚本能力
+
+当你希望工具常驻，然后由 host 脚本、UI 或自动化流程触发功能时，用 `rpc.exports`。
+
+```js
+rpc.exports = {
+    ping: function() { return "pong"; },
+    app: function() {
+        var ActivityThread = Java.use("android.app.ActivityThread");
+        var app = ActivityThread.currentApplication();
+        return String(app.getPackageName());
+    }
+};
+```
+
+启动时加 `--rpc-port`，host 侧通过 `curl` 调用：
+
+```bash
+adb forward tcp:9191 tcp:9191
+./rustfrida --pid <pid> -l script.js --rpc-port 9191
+curl -X POST http://127.0.0.1:9191/rpc/0/ping
+```
+
+### 选择建议
+
+- 普通 Java 逻辑先用 `Java.use().impl`，稳定后再考虑 DSL。
+- 高频 Java Hook 用 DSL 动态编译器，避免每次命中都进 JS runtime。
+- Native 只改参数并继续执行，用 `Interceptor.attach({ onEnter })`。
+- Native 需要决定是否调用原函数，用 `hook()` / `Interceptor.replace()`。
+- 不知道用哪个 stealth 模式时先用默认模式；遇到检测或只读代码页问题再切 `Hook.WXSHADOW` / `Hook.RECOMP`。
+
+---
+
 ## HTTP RPC 远程调用
 
 脚本里用 Frida 风格的 `rpc.exports` 注册方法，host 端通过 HTTP POST 调用，返回值会 `JSON.stringify` 后透传回来。适合把 agent 当成一个常驻服务用——UI、自动化脚本、测试框架都可以直接 `curl` 触发。
@@ -381,6 +551,24 @@ Interceptor.flush();           // no-op，兼容脚本
 
 第三参数可选 stealth 模式（同 `hook()`）：`Interceptor.attach(target, cbs, Hook.WXSHADOW)`。
 
+### Native Hook 怎么选
+
+先按你的目标选择 API，再按检测强度选择 `stealth` 参数。
+
+| 目标 | 推荐写法 | 原函数 | 说明 |
+| --- | --- | --- | --- |
+| 只看参数 | `Interceptor.attach(target, { onEnter })` | 自动执行 | 日志、统计、轻量过滤 |
+| 改参数后继续执行 | `Interceptor.attach(target, { onEnter })` | 自动执行 | `args[n] = value` 会写回参数 |
+| 看返回值或改返回值 | `Interceptor.attach(target, { onLeave })` | 自动执行 | `retval.replace(v)` 改返回值 |
+| 有时跳过原函数 | `hook(target, fn)` | 手动 `this.orig()` | 适合条件分支、绕过、完整替换 |
+| Frida replace 风格 | `Interceptor.replace(target, fn)` | 手动 | 等价于 `hook(target, fn)` |
+
+选择建议：
+
+- 只改参数并继续跑原函数：优先用 `Interceptor.attach(..., { onEnter })`。
+- 需要“有时调原函数、有时直接返回”：用 `hook()` / `Interceptor.replace()`，在回调里显式 `this.orig(...)`。
+- 高频热路径不要无条件 `this.orig()` 透传；这种场景 `attach onEnter` 更省，或者把逻辑下沉到 DSL / native fast path。
+
 ### Stealth 模式
 
 ```js
@@ -514,7 +702,7 @@ Spawn 模式下 app ClassLoader 未就绪，用 `Java.ready` 延迟执行。PID 
 
 ### Managed DSL 高频 Hook
 
-DSL 是给高频 Java hook 用的。普通 `Java.use().impl = function (...) { ... }` 每次命中都会进入 JS runtime；DSL 会生成 dex callback，热路径在 ART/Java 侧执行，适合 `HashMap.get/put`、`String.equals`、`StringBuilder.append`、`ArrayList.add` 这类自然高频点。
+DSL 是为应对高频 Java hook 开发的小型 JS-Java 动态编译器。普通 `Java.use().impl = function (...) { ... }` 每次命中都会进入 JS runtime；DSL 会把受限的 JS/Java 风格代码编译成 dex callback，让热路径在 ART/Java 侧执行，适合任何被高频调用的java方法。DSL 后续会继续优化语法、类型推断和可用能力。
 
 #### 什么时候用 DSL
 
