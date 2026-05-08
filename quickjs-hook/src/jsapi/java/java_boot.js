@@ -1330,30 +1330,14 @@
     var _readyCallbacks = [];
     var _readyFired = false;
     var _readyGateSig = "(Ljava/lang/ClassLoader;Ljava/lang/String;Landroid/content/Context;)Landroid/app/Application;";
+    var _gateInstalled = false;
 
-    Java.ready = function(fn) {
-        if (typeof fn !== "function") {
-            throw new Error("Java.ready() requires a function argument");
-        }
-
-        // ClassLoader 已就绪（非 spawn / 已触发过），立即执行
-        if (_readyFired || Java._isClassLoaderReady()) {
-            _readyFired = true;
-            fn();
-            return;
-        }
-
-        // 首个注册：安装 gate hook
-        if (_readyCallbacks.length === 0) {
+    Java._installGateHook = function() {
+        if (_gateInstalled) return;
+        try {
             _hook("android/app/Instrumentation", "newApplication", _readyGateSig, function(ctx) {
-                // 先执行原始 newApplication。stealth2/recomp 下如果在编译方法入口
-                // offset 0 就触发 FindClass/WalkStack，ART 可能在 GetDexPc/StackMap
-                // 路径上看到当前 quick frame native_pc=0 并 abort。
-                // 将 ClassLoader 更新和 ready 回调后置，避开“当前被 hook 编译帧”
-                // 仍停在入口 PC 的窗口。
                 var app = ctx.orig();
 
-                // 从第一个参数获取 ClassLoader 并更新缓存
                 if (ctx.args && ctx.args[0] !== null && ctx.args[0] !== undefined) {
                     var clPtr = ctx.args[0];
                     if (typeof clPtr === "object" && clPtr.__jptr !== undefined) {
@@ -1362,8 +1346,6 @@
                     Java._updateClassLoader(clPtr);
                 }
 
-                // 执行所有排队的回调 — 用户可在此安装 hook
-                // 注意：用户可能重新 hook newApplication，所以先保存 orig 引用
                 _readyFired = true;
                 var cbs = _readyCallbacks;
                 _readyCallbacks = [];
@@ -1377,6 +1359,23 @@
 
                 return app;
             });
+            _gateInstalled = true;
+        } catch(e) {}
+    };
+
+    Java.ready = function(fn) {
+        if (typeof fn !== "function") {
+            throw new Error("Java.ready() requires a function argument");
+        }
+
+        if (_readyFired || Java._isClassLoaderReady()) {
+            _readyFired = true;
+            fn();
+            return;
+        }
+
+        if (_readyCallbacks.length === 0) {
+            Java._installGateHook();
         }
 
         _readyCallbacks.push(fn);

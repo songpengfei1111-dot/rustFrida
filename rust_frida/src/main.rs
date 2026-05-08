@@ -307,6 +307,14 @@ fn main() {
             if let Err(e) = spawn::resume_child(pid as u32) {
                 log_error!("恢复子进程失败: {}", e);
             }
+            // deferred_java_init: 安装 gate hook（兜底）
+            if let Some(sender) = session.get_sender() {
+                let _ = send_command(sender, "javainit");
+            }
+            // deferred_java_init: 安装 gate hook（兜底，可能已在 Java.ready 时成功）
+            if let Some(sender) = session.get_sender() {
+                let _ = send_command(sender, "javainit");
+            }
         }
     }
 

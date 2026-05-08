@@ -7,5 +7,6 @@ qbdi/libQBDI.a
 loader/loader_check.o
 tools/*_test.js
 tools/*_test.sh
+tools/
 CLAUDE.md
 scripts/

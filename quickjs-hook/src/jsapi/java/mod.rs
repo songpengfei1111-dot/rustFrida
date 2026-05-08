@@ -1069,24 +1069,39 @@ pub fn deferred_java_init() -> Result<(), String> {
 
     crate::jsapi::console::output_verbose("[java] deferred_java_init: JNI 已就绪");
 
-    // 触发 Java.ready gate hook 安装：调用 Java._installGateHook()
-    // loadjs 在 resume 前运行时 Java.ready(fn) 注册了回调但 gate hook 安装失败（无 JNI）
-    // 现在 JNI 就绪，重新安装 gate hook
+    // 兜底：resume 前 Java.ready 里的 gate hook 安装可能因 JNI 未就绪而失败
     if let Err(e) = crate::load_script("Java._installGateHook && Java._installGateHook()") {
-        crate::jsapi::console::output_verbose(&format!("[java] gate hook eval 失败: {}", e));
+        crate::jsapi::console::output_verbose(&format!("[java] gate hook retry: {}", e));
     }
 
     Ok(())
 }
 
-pub fn register_java_api(ctx: &JSContext) {
-    // Spawn 模式: 跳过 JNI 初始化（由 deferred_java_init 在 resume 后完成）
-    // PID 注入模式: 立刻初始化
+use std::sync::atomic::{AtomicBool, Ordering};
+static REFLECT_CACHE_INITED: AtomicBool = AtomicBool::new(false);
+
+/// 延迟初始化 Java reflection 缓存（PID 注入模式下首次调用 Java API 时触发）
+pub(crate) fn lazy_init_reflect_cache() {
+    if REFLECT_CACHE_INITED.load(Ordering::Acquire) {
+        return;
+    }
+    crate::jsapi::console::output_verbose("[java] lazy_init_reflect_cache: probing JVM...");
     if let Ok(env) = ensure_jni_initialized() {
+        crate::jsapi::console::output_verbose("[java] lazy_init_reflect_cache: JVM found, caching...");
         unsafe {
             cache_reflect_ids(env);
         }
+        REFLECT_CACHE_INITED.store(true, Ordering::Release);
+        crate::jsapi::console::output_verbose("[java] lazy_init_reflect_cache: done");
+    } else {
+        crate::jsapi::console::output_verbose("[java] lazy_init_reflect_cache: JVM not ready, skip");
     }
+}
+
+pub fn register_java_api(ctx: &JSContext) {
+    // PID 注入模式下延迟 JNI 初始化：仅在首次调用 Java.hook/fastHook 等
+    // Java API 时才执行 cache_reflect_ids，避免在 360 加固等环境下 jsinit 阶段卡死
+    // Spawn 模式仍走 deferred_java_init 在 resume 后完成
 
     let global = ctx.global_object();
 

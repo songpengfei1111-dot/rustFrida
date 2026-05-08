@@ -292,6 +292,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_fast_hook(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    super::super::lazy_init_reflect_cache();
     let (class_name, method_name, sig, dsl) = match extract_fast_hook_args(ctx, argc, argv) {
         Ok(v) => v,
         Err(e) => return e,
@@ -327,6 +328,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_fast_hook_check(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    super::super::lazy_init_reflect_cache();
     if argc < 1 {
         return ffi::JS_ThrowTypeError(
             ctx,

@@ -22,6 +22,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    super::super::lazy_init_reflect_cache();
     if argc < 4 {
         return ffi::JS_ThrowTypeError(
             ctx,
@@ -292,6 +293,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook_quick(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    super::super::lazy_init_reflect_cache();
     if argc < 4 {
         return ffi::JS_ThrowTypeError(
             ctx,
