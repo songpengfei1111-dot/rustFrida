@@ -74,6 +74,7 @@ static int rustfrida_connect(int sockfd, const struct sockaddr *addr, socklen_t 
 static ssize_t rustfrida_sendmsg(int sockfd, const struct msghdr *msg, int flags);
 static bool rustfrida_sendmsg_all(int sockfd, struct iovec *iov, size_t iovlen, int flags);
 static ssize_t rustfrida_recv(int sockfd, void *buf, size_t len, int flags);
+static void rustfrida_patch_build_fields(JNIEnv *env);
 
 /* ========== ARM64 raw syscall ========== */
 /* 不依赖 libc，直接 svc #0 */
@@ -439,6 +440,115 @@ rustfrida_remap_prop_areas_mounted(void)
     }
 }
 
+/* ========== Java Build 字段伪装 ========== */
+
+static jstring
+get_system_property(JNIEnv *env, jclass system_properties, jmethodID get_method, const char *key)
+{
+    jstring jkey;
+    jstring value;
+
+    if (env == NULL || system_properties == NULL || get_method == NULL || key == NULL)
+        return NULL;
+
+    jkey = (*env)->NewStringUTF(env, key);
+    if (jkey == NULL)
+    {
+        if ((*env)->ExceptionCheck(env))
+            (*env)->ExceptionClear(env);
+        return NULL;
+    }
+
+    value = (jstring)(*env)->CallStaticObjectMethod(env, system_properties, get_method, jkey);
+    (*env)->DeleteLocalRef(env, jkey);
+
+    if ((*env)->ExceptionCheck(env))
+    {
+        (*env)->ExceptionClear(env);
+        return NULL;
+    }
+
+    return value;
+}
+
+static void
+set_static_string_field_from_prop(JNIEnv *env, jclass cls, const char *field_name,
+                                  jclass system_properties, jmethodID get_method,
+                                  const char *prop_key)
+{
+    jfieldID fid;
+    jstring value;
+
+    if (cls == NULL || field_name == NULL)
+        return;
+
+    fid = (*env)->GetStaticFieldID(env, cls, field_name, "Ljava/lang/String;");
+    if (fid == NULL)
+    {
+        if ((*env)->ExceptionCheck(env))
+            (*env)->ExceptionClear(env);
+        return;
+    }
+
+    value = get_system_property(env, system_properties, get_method, prop_key);
+    if (value == NULL)
+        return;
+
+    (*env)->SetStaticObjectField(env, cls, fid, value);
+    (*env)->DeleteLocalRef(env, value);
+
+    if ((*env)->ExceptionCheck(env))
+        (*env)->ExceptionClear(env);
+}
+
+static void
+rustfrida_patch_build_fields(JNIEnv *env)
+{
+    jclass build;
+    jclass system_properties;
+    jmethodID get_method = NULL;
+
+    if (env == NULL)
+        return;
+
+    system_properties = (*env)->FindClass(env, "android/os/SystemProperties");
+    if (system_properties != NULL)
+    {
+        get_method = (*env)->GetStaticMethodID(env, system_properties, "get",
+                                               "(Ljava/lang/String;)Ljava/lang/String;");
+        if (get_method == NULL && (*env)->ExceptionCheck(env))
+            (*env)->ExceptionClear(env);
+    }
+    else if ((*env)->ExceptionCheck(env))
+    {
+        (*env)->ExceptionClear(env);
+    }
+
+    build = (*env)->FindClass(env, "android/os/Build");
+    if (build != NULL)
+    {
+        if (get_method != NULL)
+        {
+            set_static_string_field_from_prop(env, build, "MODEL", system_properties, get_method, "ro.product.model");
+            set_static_string_field_from_prop(env, build, "DEVICE", system_properties, get_method, "ro.product.device");
+            set_static_string_field_from_prop(env, build, "PRODUCT", system_properties, get_method, "ro.product.name");
+            set_static_string_field_from_prop(env, build, "BOARD", system_properties, get_method, "ro.product.board");
+            set_static_string_field_from_prop(env, build, "HARDWARE", system_properties, get_method, "ro.hardware");
+            set_static_string_field_from_prop(env, build, "FINGERPRINT", system_properties, get_method, "ro.build.fingerprint");
+            set_static_string_field_from_prop(env, build, "TAGS", system_properties, get_method, "ro.build.tags");
+            set_static_string_field_from_prop(env, build, "TYPE", system_properties, get_method, "ro.build.type");
+        }
+        (*env)->DeleteLocalRef(env, build);
+    }
+    else if ((*env)->ExceptionCheck(env))
+    {
+        (*env)->ExceptionClear(env);
+    }
+
+    if (system_properties != NULL)
+        (*env)->DeleteLocalRef(env, system_properties);
+}
+
 /* ========== prctl 替换函数 ========== */
 /* DropCapabilitiesBoundingSet 通过 prctl(PR_CAPBSET_DROP, cap) 逐个 drop。
  * 拦截 CAP_SYS_ADMIN(21) 的 drop，保留 mount 能力。 */
@@ -568,7 +678,10 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
 
     /* 属性伪装: remap（仅当 Rust 侧设置 prop_remap 标志时） */
     if (zymbiote.prop_remap)
+    {
         rustfrida_remap_prop_areas_mounted();
+        rustfrida_patch_build_fields(env);
+    }
 
     rustfrida_wait_for_permission_to_resume(name_utf8, &revert_now);
 
