@@ -63,7 +63,7 @@ impl StealthMode {
 /// Hook 安装种类: Replace 单阶段（hook_replace） or Attach 双阶段（hook_attach）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HookKind {
-    /// hook_replace: 完全替换，thunk 只在进入时调 on_enter；callOriginal 靠 ctx.orig() 显式触发
+    /// hook_replace: 完全替换，thunk 只在进入时调 on_enter；callOriginal 靠 ctx.$orig() 显式触发
     Replace,
     /// hook_attach: Frida-style，thunk 自动 BLR 原函数；on_enter 观察/改参数，on_leave 观察/改返回值
     Attach,

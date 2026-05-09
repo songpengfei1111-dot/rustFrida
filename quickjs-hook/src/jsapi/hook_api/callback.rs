@@ -1,7 +1,7 @@
 //! Hook callback wrapper (cross-thread safety, context building) — replace mode
 //!
 //! The thunk saves context and calls on_enter, then restores x0 and returns.
-//! The callback can optionally call the original function via orig().
+//! The callback can optionally call the original function via $orig().
 
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
@@ -211,7 +211,7 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
         &callback_bytes,
         "hook",
         target_addr,
-        // 构建 JS 上下文对象：x0-x30, sp, pc, trampoline, orig()
+        // 构建 JS 上下文对象：x0-x30, sp, pc, trampoline, $orig()
         |ctx| {
             let js_ctx = ffi::JS_NewObject(ctx);
             let hook_ctx = &*ctx_ptr;
@@ -223,18 +223,18 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
             set_js_u64_property_atom(ctx, js_ctx, atoms.sp, hook_ctx.sp);
             set_js_u64_property_atom(ctx, js_ctx, atoms.pc, hook_ctx.pc);
             set_js_u64_property_atom(ctx, js_ctx, atoms.trampoline, trampoline);
-            // Bind callback-local state to the context object so ctx.orig() remains stable
+            // Bind callback-local state to the context object so ctx.$orig() remains stable
             // even if nested hooks temporarily overwrite the global fallback state.
             set_js_u64_property_atom(ctx, js_ctx, atoms.hook_ctx_ptr, ctx_ptr as usize as u64);
             set_js_u64_property_atom(ctx, js_ctx, atoms.hook_trampoline, trampoline);
-            set_js_cfunction_property(ctx, js_ctx, "orig", js_native_call_original, 0);
+            set_js_cfunction_property(ctx, js_ctx, "$orig", js_native_call_original, 0);
 
             js_ctx
         },
         // 处理返回值：
         // 1. 先同步 JS ctx 上所有被修改的寄存器到 C HookContext
         // 2. 显式 return 值 → 覆盖 x0
-        // 3. 不 return（undefined）→ 保持 ctx.x0 的值（可能被 JS 修改或被 orig() 写入）
+        // 3. 不 return（undefined）→ 保持 ctx.x0 的值（可能被 JS 修改或被 $orig() 写入）
         |ctx, js_ctx, result| {
             result_was_set = true;
             // 同步 JS ctx 属性 → C HookContext（用户可能修改了 ctx.x0 等）
@@ -250,7 +250,7 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
             if ffi::qjs_is_undefined(result_val) == 0 {
                 (*ctx_ptr).x[0] = js_value_to_u64_or_zero(ctx, crate::value::JSValue(result_val));
             }
-            // undefined 时保持 ctx.x0 (可能是 orig() 写入的返回值或 JS 修改的值)
+            // undefined 时保持 ctx.x0 (可能是 $orig() 写入的返回值或 JS 修改的值)
         },
         // native hook 不需要 JS 异常内 fallback (外层 trampoline 兜底已够)
         |_ctx, _js_ctx| {},
@@ -265,11 +265,11 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
     }
 }
 
-/// JS CFunction: ctx.orig()
+/// JS CFunction: ctx.$orig()
 ///
 /// 无参数: 先同步 JS ctx 对象上被修改的寄存器到 C HookContext，再调用 trampoline。
 /// 兼容旧脚本的有参数形式: 用传入的参数覆盖 x0-xN，其余寄存器同步自 JS ctx。
-/// 新脚本优先写 this.xN 后无参数调用 orig()；固定继续原函数应使用 attach。
+/// 新脚本优先写 this.xN 后无参数调用 $orig()；固定继续原函数应使用 attach。
 ///
 /// 返回原函数的返回值 (BigUint64 或 Number)，同时写入 ctx.x[0]。
 unsafe extern "C" fn js_native_call_original(
@@ -303,7 +303,7 @@ unsafe extern "C" fn js_native_call_original(
     if ctx_ptr.is_null() || trampoline == 0 {
         return ffi::JS_ThrowInternalError(
             ctx,
-            b"orig() can only be called inside a hook callback\0".as_ptr() as *const _,
+            b"$orig() can only be called inside a hook callback\0".as_ptr() as *const _,
         );
     }
 
@@ -314,7 +314,7 @@ unsafe extern "C" fn js_native_call_original(
     }
     hook_ctx.sp = get_js_u64_property_atom(ctx, this_val, atoms.sp);
 
-    // 如果 orig() 传了参数，按顺序覆盖 x0-xN (最多 x0-x30)
+    // 如果 $orig() 传了参数，按顺序覆盖 x0-xN (最多 x0-x30)
     let max_args = (argc as usize).min(31);
     for i in 0..max_args {
         let val = crate::value::JSValue(*argv.add(i));
@@ -327,7 +327,7 @@ unsafe extern "C" fn js_native_call_original(
     // Write result back to HookContext.x[0] so the thunk's final RET returns this value
     (*ctx_ptr).x[0] = result;
 
-    // 同步返回值到 JS ctx.x0 属性，使 ctx.orig() 后读 ctx.x0 能拿到返回值
+    // 同步返回值到 JS ctx.x0 属性，使 ctx.$orig() 后读 ctx.x0 能拿到返回值
     set_js_u64_property_atom(ctx, this_val, atoms.x[0], result);
 
     // Return value: Number (≤2^53) or BigUint64
@@ -337,7 +337,7 @@ unsafe extern "C" fn js_native_call_original(
 // ══════════════════════════════════════════════════════════════════════════════
 // Attach 模式 (Frida Interceptor.attach)
 //
-// hook_attach 的 thunk 自动执行 BLR trampoline (原函数)，不需要 ctx.orig()。
+// hook_attach 的 thunk 自动执行 BLR trampoline (原函数)，不需要 ctx.$orig()。
 // on_enter 在调用原函数前运行，可改 x0-x7 (参数) 或 ctx.intercept_leave。
 // on_leave 在原函数返回后运行，可改 x0 (返回值)。
 //
