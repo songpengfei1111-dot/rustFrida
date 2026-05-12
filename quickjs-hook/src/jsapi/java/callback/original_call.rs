@@ -491,11 +491,12 @@ pub(crate) unsafe fn invoke_original_jni(
     is_static: bool,
     jargs_ptr: *const std::ffi::c_void,
     quick_trampoline: u64,
-    use_blr: bool,
+    _use_blr: bool,
 ) -> u64 {
     jni_check_exc(env);
 
     let thread_id = crate::current_thread_id_u64();
+    let method_id_addr = lookup_call_original_method_id(art_method_addr);
 
     // Generic JNI entry point does not have the original HookContext here, so
     // only callers that can patch the router frame should use the BLR fast path.
@@ -509,15 +510,57 @@ pub(crate) unsafe fn invoke_original_jni(
         false
     };
 
+    let (call_this_obj, delete_local_after) = if !is_static {
+        if this_obj == 0 {
+            (0, false)
+        } else {
+            let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+            let local = new_local_ref(env, this_obj as *mut std::ffi::c_void) as u64;
+            if local == 0 || jni_check_exc(env) {
+                if bypass_set {
+                    hook_ffi::orig_bypass_clear(thread_id);
+                }
+                crate::jsapi::java::art_controller::clear_call_original_bypass();
+                return 0;
+            }
+            (local, true)
+        }
+    } else {
+        (this_obj, false)
+    };
+
     let result = invoke_original_jni_inner(
-        env, art_method_addr, class_global_ref, this_obj, return_type, is_static, jargs_ptr,
+        env, method_id_addr, class_global_ref, call_this_obj, return_type, is_static, jargs_ptr,
     );
+
+    if delete_local_after {
+        let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+        delete_local_ref(env, call_this_obj as *mut std::ffi::c_void);
+    }
 
     if bypass_set {
         hook_ffi::orig_bypass_clear(thread_id);
     }
     crate::jsapi::java::art_controller::clear_call_original_bypass();
     result
+}
+
+unsafe fn lookup_call_original_method_id(art_method_addr: u64) -> u64 {
+    let clone_addr = {
+        let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .and_then(|registry| registry.get(&art_method_addr))
+            .map(|data| data.clone_addr)
+            .unwrap_or(0)
+    };
+    if clone_addr != 0 {
+        let declaring_class = std::ptr::read_volatile(art_method_addr as *const u32);
+        std::ptr::write_volatile(clone_addr as *mut u32, declaring_class);
+        clone_addr
+    } else {
+        art_method_addr
+    }
 }
 
 unsafe fn invoke_original_jni_inner(
@@ -734,6 +777,17 @@ unsafe fn js_value_from_primitive_return(
     }
 }
 
+unsafe fn js_value_from_quick_return(
+    ctx: *mut ffi::JSContext,
+    ret_raw: u64,
+    return_type: u8,
+) -> ffi::JSValue {
+    match return_type {
+        b'L' | b'[' => ffi::JS_NewBigUint64(ctx, ret_raw),
+        _ => js_value_from_primitive_return(ctx, ret_raw, return_type),
+    }
+}
+
 #[inline]
 fn is_object_sig(type_sig: Option<&str>) -> bool {
     matches!(type_sig, Some(s) if s.starts_with('L') || s.starts_with('['))
@@ -887,6 +941,25 @@ unsafe extern "C" fn js_call_original(
 
     let hook_ctx = &*ctx_ptr;
 
+    // Compiled quick callbacks use ART quick ABI:
+    //   x0=ArtMethod*, x1=this/raw class, x2+=args.
+    // Do not route this through JNI CallNonvirtual*; x1 is a raw mirror
+    // pointer, not a jobject transition ref. Invoke the relocated quick
+    // trampoline with the saved quick registers instead.
+    if hook_ctx.x[0] == art_method_addr && quick_trampoline != 0 && native_entry_trampoline == 0 {
+        let ret_x0 = hook_ffi::hook_invoke_trampoline(
+            ctx_ptr,
+            quick_trampoline as *mut std::ffi::c_void,
+        );
+        let ret_raw = if matches!(return_type, b'F' | b'D') {
+            (*ctx_ptr).d[0]
+        } else {
+            ret_x0
+        };
+        (*ctx_ptr).x[0] = ret_x0;
+        return js_value_from_quick_return(ctx, ret_raw, return_type);
+    }
+
     if native_entry_trampoline != 0 && native_entry_critical {
         let ret_x0 = hook_ffi::hook_invoke_trampoline(
             ctx_ptr,
@@ -938,6 +1011,18 @@ unsafe extern "C" fn js_call_original(
     } else {
         std::ptr::null()
     };
+
+    if !is_static && hook_ctx.x[1] == 0 {
+        return match return_type {
+            b'V' => ffi::qjs_undefined(),
+            b'Z' => JSValue::bool(false).raw(),
+            b'I' | b'B' | b'C' | b'S' => JSValue::int(0).raw(),
+            b'J' => ffi::JS_NewBigUint64(ctx, 0),
+            b'F' | b'D' => JSValue::float(0.0).raw(),
+            b'L' | b'[' => ffi::qjs_null(),
+            _ => ffi::qjs_undefined(),
+        };
+    }
 
     if use_blr
         && quick_trampoline != 0

@@ -12,7 +12,7 @@ use super::super::art_method::*;
 use super::super::callback::*;
 use super::super::jni_core::*;
 use super::install_support::{
-    create_class_global_ref, create_replacement_art_method, install_per_method_router_hook,
+    alloc_art_method_clone, create_class_global_ref, create_replacement_art_method, install_per_method_router_hook,
     update_original_method_flags_for_hook, JavaHookInstallGuard,
 };
 
@@ -161,7 +161,6 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     let original_access_flags = std::ptr::read_volatile((art_method as usize + spec.access_flags_offset) as *const u32);
     let original_data = std::ptr::read_volatile((art_method as usize + data_off) as *const u64);
     let original_entry_point = read_entry_point(art_method, ep_offset);
-
     output_verbose(&format!(
         "[java hook] Step 1 fetchArtMethod: art_method={:#x}, flags={:#x}, data_={:#x}, ep={:#x}",
         art_method, original_access_flags, original_data, original_entry_point
@@ -177,7 +176,11 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         }
     }
 
-    // 2-ArtMethod 模型: 不再分配 clone，callOriginal 直接用原始 ArtMethod
+    let clone_size = spec.size;
+    let clone_addr = match alloc_art_method_clone(art_method, clone_size) {
+        Ok(addr) => addr,
+        Err(msg) => return throw_internal_error(ctx, msg),
+    };
 
     let bridge = find_art_bridge_functions(env, ep_offset);
     let jni_trampoline = bridge.quick_generic_jni_trampoline;
@@ -191,7 +194,6 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
             return throw_internal_error(ctx, msg);
         }
     };
-    let clone_size = spec.size;
     let mut install_guard = JavaHookInstallGuard::new(
         art_method,
         spec.access_flags_offset,
@@ -314,7 +316,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
                     replacement_addr,
                     per_method_hook_target,
                 },
-                clone_addr: 0, // 2-ArtMethod 模型: 不再使用 clone
+                clone_addr,
                 class_global_ref,
                 return_type,
                 return_type_sig: return_type_sig.clone(),
@@ -498,6 +500,10 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook_quick(
     let original_access_flags = std::ptr::read_volatile((art_method as usize + spec.access_flags_offset) as *const u32);
     let original_data = std::ptr::read_volatile((art_method as usize + data_off) as *const u64);
     let original_entry_point = read_entry_point(art_method, ep_offset);
+    let clone_addr = match alloc_art_method_clone(art_method, spec.size) {
+        Ok(addr) => addr,
+        Err(msg) => return throw_internal_error(ctx, msg),
+    };
 
     let bridge = find_art_bridge_functions(env, ep_offset);
     let jni_trampoline = bridge.quick_generic_jni_trampoline;
@@ -578,7 +584,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook_quick(
                     per_method_hook_target,
                     declaring_class_source: art_method,
                 },
-                clone_addr: 0,
+                clone_addr,
                 class_global_ref,
                 return_type: get_return_type_from_sig(&actual_sig),
                 return_type_sig: get_return_type_sig(&actual_sig),

@@ -1411,7 +1411,7 @@ pub(super) unsafe fn remove_native_trampoline(data: &JavaHookData) {
     hook_ffi::hook_remove_redirect(data.art_method);
 }
 
-/// 释放 replacement ArtMethod 堆内存 + JNI global ref + JS callback。
+/// 释放 replacement/clone ArtMethod 堆内存 + JNI global ref + JS callback。
 pub(super) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Option<JniEnv>) {
     let replacement_addr = match &data.hook_type {
         callback::HookType::Replaced { replacement_addr, .. } | callback::HookType::Quick { replacement_addr, .. } => {
@@ -1421,6 +1421,9 @@ pub(super) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Opti
     };
     if replacement_addr != 0 {
         libc::free(replacement_addr as *mut std::ffi::c_void);
+    }
+    if data.clone_addr != 0 {
+        libc::free(data.clone_addr as *mut std::ffi::c_void);
     }
 
     if data.class_global_ref != 0 {

@@ -479,7 +479,9 @@ pub(crate) unsafe fn get_js_u64_property_atom(ctx: *mut ffi::JSContext, obj: ffi
 
 /// Convert a JS numeric/BigInt value to u64, defaulting to 0 on conversion failure.
 pub(crate) unsafe fn js_value_to_u64_or_zero(ctx: *mut ffi::JSContext, value: JSValue) -> u64 {
-    value.to_u64(ctx).unwrap_or(0)
+    get_native_pointer_addr(ctx, value)
+        .or_else(|| value.to_u64(ctx))
+        .unwrap_or(0)
 }
 
 /// Encode a u64 as Number when it fits JS safe integer range, otherwise BigUint64.

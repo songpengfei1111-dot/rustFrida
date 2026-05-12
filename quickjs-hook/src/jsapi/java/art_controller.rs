@@ -19,6 +19,7 @@
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::output_verbose;
 use crate::jsapi::module::{libart_dlsym, module_dlsym};
+use crate::jsapi::util::{proc_maps_entries, read_proc_self_maps};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -491,6 +492,8 @@ struct ArtControllerState {
     fixup_hook_target: u64,
     /// PrettyMethod hook 地址 (0 表示未安装)
     pretty_method_hook_target: u64,
+    /// DecodeGcMasksOnly NULL header guard hook 地址 (0 表示未安装)
+    decode_gc_masks_hook_target: u64,
 }
 
 unsafe impl Send for ArtControllerState {}
@@ -874,13 +877,18 @@ pub(super) fn ensure_art_controller_initialized(
     // hook_replace 只拦截非内联调用。内联点需要单独 patch。
     let oat_inline_patched: i32 = unsafe { hook_ffi::hook_patch_inlined_oat_header_checks() };
 
+    // API 36 的 GC WalkStack 可直接调用 DecodeGcMasksOnly(NULL)。信号 fallback
+    // 容易被 app 后装的 crash handler 挤掉，所以主动在 DecodeGcMasksOnly 的
+    // 首个 header load 前把 NULL x0 改成 dummy header。
+    let decode_gc_masks_hook_target = unsafe { install_decode_gc_masks_only_null_guard() };
+
     // SIGSEGV guard 作为 fallback
     unsafe {
         install_walkstack_sigsegv_guard();
     }
 
     output_verbose(&format!(
-        "[artController] 初始化完成: Layer1={}, Layer2={}, GC={}, OatHeader={}, Fixup={}, PrettyMethod={}, InlinePatch={}",
+        "[artController] 初始化完成: Layer1={}, Layer2={}, GC={}, OatHeader={}, Fixup={}, PrettyMethod={}, DecodeGcMasks={}, InlinePatch={}",
         shared_stub_targets.len(),
         do_call_targets.len(),
         gc_hook_targets.len(),
@@ -891,6 +899,7 @@ pub(super) fn ensure_art_controller_initialized(
         } else {
             "none"
         },
+        if decode_gc_masks_hook_target != 0 { "active" } else { "none" },
         if oat_inline_patched > 0 { oat_inline_patched } else { 0 },
     ));
 
@@ -901,6 +910,7 @@ pub(super) fn ensure_art_controller_initialized(
         oat_header_hook_target,
         fixup_hook_target,
         pretty_method_hook_target,
+        decode_gc_masks_hook_target,
     });
 }
 
@@ -1563,6 +1573,21 @@ static DUMMY_OAT_HEADER_BUF: [u8; 64] = [0u8; 64];
 /// 旧的 SIGSEGV handler (chain 用)
 static mut PREV_SIGSEGV_ACTION: libc::sigaction = unsafe { std::mem::zeroed() };
 static WALKSTACK_GUARD_INSTALLED: AtomicBool = AtomicBool::new(false);
+static WALKSTACK_GUARD_USING_SIGCHAIN: AtomicBool = AtomicBool::new(false);
+
+fn arm64_load_unsigned_base_reg(inst: u32) -> Option<usize> {
+    // LDR{B,H,W,X} unsigned immediate:
+    //   size  opc  fixed
+    //   xx    01   111001
+    // Match all element sizes and only loads, then return Rn.
+    if (inst & 0x3b40_0000) == 0x3940_0000 {
+        let rn = ((inst >> 5) & 0x1f) as usize;
+        if rn < 31 {
+            return Some(rn);
+        }
+    }
+    None
+}
 
 unsafe fn bionic_sigaction(sig: libc::c_int, act: *const libc::sigaction, oldact: *mut libc::sigaction) -> libc::c_int {
     let sym = module_dlsym("libc.so", "sigaction");
@@ -1812,28 +1837,170 @@ unsafe extern "C" fn walkstack_sigsegv_handler(
         }
     }
 
-    if !info.is_null() && !context.is_null() {
-        let fault_addr = (*info).si_addr() as u64;
-        // 精准匹配: fault_addr == 0x18 说明是 NULL+0x18 解引用 (OAT header 字段访问)
-        if fault_addr == 0x18 {
-            let uc = context as *mut libc::ucontext_t;
-            let regs = &mut (*uc).uc_mcontext.regs;
-            // X10 = regs[10], 如果 X10 == 0 说明是我们关心的 WalkStack NULL header 场景
-            if regs[10] == 0 {
-                // 修复: X10 指向 dummy buffer，让后续 LDR 读到 0 而不是崩溃
-                regs[10] = DUMMY_OAT_HEADER_BUF.as_ptr() as u64;
-                // 不需要修改 PC — 返回后重新执行同一条 LDR 指令，这次 X10 有效
-                return;
-            }
-        }
+    if try_handle_walkstack_null_oat_header(sig, info, context) {
+        return;
     }
 
     // 不是我们关心的场景 → chain 到旧 handler
     chain_prev_sigsegv(sig, info, context);
 }
 
+unsafe fn try_handle_walkstack_null_oat_header(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) -> bool {
+    if sig != libc::SIGSEGV || info.is_null() || context.is_null() {
+        return false;
+    }
+
+    let fault_addr = (*info).si_addr() as u64;
+    // 精准匹配 NULL OatQuickMethodHeader 前 64 字节访问。旧路径只见过
+    // NULL+0x18 且 base 固定为 X10；API 36 的 DecodeGcMasksOnly 也会从
+    // NULL+0x0 读取。按当前 LDR 指令解码 base 寄存器，确认其值为 0 后
+    // 指向全零 dummy header，返回后重执行同一条 load。
+    if fault_addr >= DUMMY_OAT_HEADER_BUF.len() as u64 {
+        return false;
+    }
+
+    let uc = context as *mut libc::ucontext_t;
+    let mc = &mut (*uc).uc_mcontext;
+    let pc = mc.pc & PAC_STRIP_MASK;
+    if pc != 0 && (pc & 0x3) == 0 {
+        let inst = core::ptr::read_unaligned(pc as *const u32);
+        if let Some(rn) = arm64_load_unsigned_base_reg(inst) {
+            let regs = &mut mc.regs;
+            if regs[rn] == 0 {
+                regs[rn] = DUMMY_OAT_HEADER_BUF.as_ptr() as u64;
+                return true;
+            }
+        }
+    }
+
+    // Fallback for the original known pattern, in case the compiler used a
+    // load form not covered by the unsigned-immediate decoder above.
+    if fault_addr == 0x18 {
+        let regs = &mut mc.regs;
+        if regs[10] == 0 {
+            regs[10] = DUMMY_OAT_HEADER_BUF.as_ptr() as u64;
+            return true;
+        }
+    }
+
+    false
+}
+
+unsafe extern "C" fn walkstack_sigchain_handler(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) -> bool {
+    try_handle_managed_implicit_suspend(sig, info, context)
+        || try_handle_walkstack_null_oat_header(sig, info, context)
+}
+
+unsafe extern "C" fn on_decode_gc_masks_only_enter(
+    ctx: *mut hook_ffi::HookContext,
+    _user_data: *mut std::ffi::c_void,
+) {
+    if !ctx.is_null() && (*ctx).x[0] == 0 {
+        (*ctx).x[0] = DUMMY_OAT_HEADER_BUF.as_ptr() as u64;
+    }
+}
+
+unsafe fn find_decode_gc_masks_only_header_load() -> u64 {
+    // Android 16 / API 36 libart DecodeGcMasksOnly prologue through the first
+    // OatQuickMethodHeader load. Keep the prologue in the signature; the tail
+    // alone also appears in GetOatQuickMethodHeader and would patch the wrong
+    // site.
+    const PATTERN: &[u8] = &[
+        0xff, 0x43, 0x07, 0xd1, 0xfd, 0x7b, 0x1a, 0xa9, 0xfc, 0x57, 0x1b, 0xa9, 0xf4, 0x4f,
+        0x1c, 0xa9, 0xfd, 0x83, 0x06, 0x91, 0x54, 0xd0, 0x3b, 0xd5, 0xf3, 0x03, 0x08, 0xaa,
+        0x00, 0xe4, 0x00, 0x6f, 0x88, 0x16, 0x40, 0xf9, 0xe2, 0x03, 0x1f, 0xaa, 0xf5, 0x03,
+        0x00, 0x91, 0xa8, 0x83, 0x1f, 0xf8, 0x08, 0x00, 0x40, 0xb9,
+    ];
+
+    let Some(maps) = read_proc_self_maps() else {
+        return 0;
+    };
+
+    let mut best = 0u64;
+    for entry in proc_maps_entries(&maps) {
+        let Some(path) = entry.path else {
+            continue;
+        };
+        if !path.ends_with("/libart.so") || !entry.perms.starts_with("r-x") {
+            continue;
+        }
+        let len = entry.end.saturating_sub(entry.start) as usize;
+        if len < PATTERN.len() {
+            continue;
+        }
+        let bytes = core::slice::from_raw_parts(entry.start as *const u8, len);
+        for (off, window) in bytes.windows(PATTERN.len()).enumerate() {
+            if window == PATTERN {
+                best = entry.start + off as u64 + (PATTERN.len() as u64 - 4);
+            }
+        }
+    }
+
+    best
+}
+
+unsafe fn install_decode_gc_masks_only_null_guard() -> u64 {
+    let target = find_decode_gc_masks_only_header_load();
+    if target == 0 {
+        output_verbose("[artController] DecodeGcMasksOnly NULL guard 跳过: pattern not found");
+        return 0;
+    }
+
+    let ret = hook_ffi::hook_attach(
+        target as *mut std::ffi::c_void,
+        Some(on_decode_gc_masks_only_enter),
+        None,
+        std::ptr::null_mut(),
+        0,
+    );
+    if ret == 0 {
+        output_verbose(&format!(
+            "[artController] DecodeGcMasksOnly NULL guard 安装成功: load={:#x}",
+            target
+        ));
+        target
+    } else {
+        output_verbose(&format!(
+            "[artController] DecodeGcMasksOnly NULL guard 安装失败: load={:#x}, ret={}",
+            target, ret
+        ));
+        0
+    }
+}
+
 unsafe fn install_walkstack_sigsegv_guard() {
     if WALKSTACK_GUARD_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let add = module_dlsym("libsigchain.so", "AddSpecialSignalHandlerFn");
+    let ensure_front = module_dlsym("libsigchain.so", "EnsureFrontOfChain");
+    if !add.is_null() {
+        let mut action: SigchainAction = std::mem::zeroed();
+        action.sc_sigaction = Some(walkstack_sigchain_handler);
+        libc::sigemptyset(&mut action.sc_mask);
+        action.sc_flags = 0;
+
+        type AddSpecialSignalHandlerFn = unsafe extern "C" fn(libc::c_int, *mut SigchainAction);
+        let add_fn: AddSpecialSignalHandlerFn = std::mem::transmute(add);
+        add_fn(libc::SIGSEGV, &mut action as *mut SigchainAction);
+
+        if !ensure_front.is_null() {
+            type EnsureFrontOfChainFn = unsafe extern "C" fn(libc::c_int);
+            let ensure_front_fn: EnsureFrontOfChainFn = std::mem::transmute(ensure_front);
+            ensure_front_fn(libc::SIGSEGV);
+        }
+
+        WALKSTACK_GUARD_USING_SIGCHAIN.store(true, Ordering::SeqCst);
+        output_verbose("[artController] WalkStack SIGSEGV guard 已安装 (libsigchain)");
         return;
     }
 
@@ -1855,6 +2022,16 @@ unsafe fn install_walkstack_sigsegv_guard() {
 }
 
 pub(crate) unsafe fn refresh_walkstack_sigsegv_guard() {
+    if WALKSTACK_GUARD_USING_SIGCHAIN.load(Ordering::SeqCst) {
+        let ensure_front = module_dlsym("libsigchain.so", "EnsureFrontOfChain");
+        if !ensure_front.is_null() {
+            type EnsureFrontOfChainFn = unsafe extern "C" fn(libc::c_int);
+            let ensure_front_fn: EnsureFrontOfChainFn = std::mem::transmute(ensure_front);
+            ensure_front_fn(libc::SIGSEGV);
+        }
+        return;
+    }
+
     let mut current: libc::sigaction = std::mem::zeroed();
     if bionic_sigaction(libc::SIGSEGV, std::ptr::null(), &mut current) != 0 {
         return;
@@ -1961,6 +2138,9 @@ pub fn cut_art_controller_walkstack_guards() {
         }
         if state.pretty_method_hook_target != 0 {
             all.push(("PrettyMethod", state.pretty_method_hook_target));
+        }
+        if state.decode_gc_masks_hook_target != 0 {
+            all.push(("DecodeGcMasks", state.decode_gc_masks_hook_target));
         }
         all
     };

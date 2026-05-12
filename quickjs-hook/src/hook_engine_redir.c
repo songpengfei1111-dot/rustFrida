@@ -88,7 +88,7 @@ static void emit_store_replacement_for_stackvisitor(Arm64Writer* w, uint64_t ori
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X15, original_method);
     arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X17, ARM64_REG_X15);
     arm64_writer_put_b_cond_label(w, ARM64_COND_EQ, lbl_found);
-    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_X16, 16);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_X16, sizeof(ArtRouterEntry));
     arm64_writer_put_b_label(w, lbl_loop);
 
     arm64_writer_put_label(w, lbl_found);

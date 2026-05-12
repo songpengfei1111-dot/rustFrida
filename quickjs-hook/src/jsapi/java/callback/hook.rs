@@ -367,18 +367,24 @@ pub(super) unsafe extern "C" fn java_hook_callback(
             }
         } else if !env.is_null() {
             let hook_ctx = &*ctx_ptr;
-            let jargs = build_jargs_from_registers(hook_ctx, param_count, &param_types);
-            let jargs_ptr = if param_count > 0 {
-                jargs.as_ptr() as *const std::ffi::c_void
+            if !is_static && hook_ctx.x[1] == 0 {
+                if return_type != b'V' {
+                    write_primitive_return_to_context(ctx_ptr, return_type, 0);
+                }
             } else {
-                std::ptr::null()
-            };
-            let ret = invoke_original_jni(
-                env, art_method_addr, class_global_ref,
-                hook_ctx.x[1], return_type, is_static, jargs_ptr, quick_trampoline, false,
-            );
-            if return_type != b'V' {
-                write_primitive_return_to_context(ctx_ptr, return_type, ret);
+                let jargs = build_jargs_from_registers(hook_ctx, param_count, &param_types);
+                let jargs_ptr = if param_count > 0 {
+                    jargs.as_ptr() as *const std::ffi::c_void
+                } else {
+                    std::ptr::null()
+                };
+                let ret = invoke_original_jni(
+                    env, art_method_addr, class_global_ref,
+                    hook_ctx.x[1], return_type, is_static, jargs_ptr, quick_trampoline, false,
+                );
+                if return_type != b'V' {
+                    write_primitive_return_to_context(ctx_ptr, return_type, ret);
+                }
             }
         } else {
             (*ctx_ptr).x[0] = 0;
@@ -710,6 +716,7 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
             set_js_u64_property_atom(ctx, js_ctx, atoms.env, 0);
             set_js_u64_property_atom(ctx, js_ctx, atoms.hook_ctx_ptr, ctx_ptr as usize as u64);
             set_js_u64_property_atom(ctx, js_ctx, atoms.hook_art_method, art_method_addr);
+            set_js_cfunction_property(ctx, js_ctx, "orig", js_call_original, 0);
 
             js_ctx
         },

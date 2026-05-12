@@ -8,6 +8,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 #[repr(C)]
 struct TCCState {
@@ -41,16 +42,48 @@ const PR_SET_VMA_ANON_NAME: libc::c_int = 0;
 static CMODULE_CLASS_ID: AtomicU32 = AtomicU32::new(0);
 const CMODULE_CLASS_NAME: &[u8] = b"CModule\0";
 static CMODULE_CODE_VMA_NAME: &[u8] = b"wwb_cmodule_code\0";
+static CMODULE_CODE_RANGES: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 struct CModuleData {
     state: *mut TCCState,
     code: *mut c_void,
-    code_size: usize,
+    map_size: usize,
 }
 
 struct CompileContext {
     errors: String,
     imports: HashMap<String, u64>,
+}
+
+pub(crate) fn is_cmodule_code_address(addr: u64) -> bool {
+    CMODULE_CODE_RANGES
+        .lock()
+        .map(|ranges| ranges.iter().any(|(start, end)| addr >= *start && addr < *end))
+        .unwrap_or(false)
+}
+
+fn register_cmodule_code_range(code: *mut c_void, map_size: usize) {
+    if code.is_null() || map_size == 0 {
+        return;
+    }
+    let start = code as u64;
+    let Some(end) = start.checked_add(map_size as u64) else {
+        return;
+    };
+    if let Ok(mut ranges) = CMODULE_CODE_RANGES.lock() {
+        ranges.push((start, end));
+    }
+}
+
+fn unregister_cmodule_code_range(code: *mut c_void, map_size: usize) {
+    if code.is_null() || map_size == 0 {
+        return;
+    }
+    let start = code as u64;
+    let end = start.saturating_add(map_size as u64);
+    if let Ok(mut ranges) = CMODULE_CODE_RANGES.lock() {
+        ranges.retain(|(range_start, range_end)| *range_start != start || *range_end != end);
+    }
 }
 
 unsafe fn mark_cmodule_code_vma(code: *mut c_void, code_size: usize) {
@@ -81,9 +114,37 @@ unsafe extern "C" fn cmodule_finalizer(_rt: *mut ffi::JSRuntime, val: ffi::JSVal
     if !data.state.is_null() {
         tcc_delete(data.state);
     }
-    if !data.code.is_null() && data.code_size != 0 {
-        libc::munmap(data.code, data.code_size);
+    if !data.code.is_null() && data.map_size != 0 {
+        unregister_cmodule_code_range(data.code, data.map_size);
+        let _ = raw_munmap(data.code, data.map_size);
     }
+}
+
+fn page_align_len(len: usize) -> Option<usize> {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page = if page > 0 { page as usize } else { 4096 };
+    len.checked_add(page - 1).map(|v| v & !(page - 1))
+}
+
+unsafe fn raw_mmap(len: usize, prot: i32, flags: i32) -> *mut c_void {
+    let ret = libc::syscall(
+        libc::SYS_mmap as libc::c_long,
+        ptr::null_mut::<c_void>(),
+        len,
+        prot,
+        flags,
+        -1i32,
+        0usize,
+    );
+    if ret == -1 {
+        libc::MAP_FAILED
+    } else {
+        ret as *mut c_void
+    }
+}
+
+unsafe fn raw_munmap(addr: *mut c_void, len: usize) -> i32 {
+    libc::syscall(libc::SYS_munmap as libc::c_long, addr, len) as i32
 }
 
 fn get_or_init_class_id(ctx: *mut ffi::JSContext) -> u32 {
@@ -497,19 +558,20 @@ unsafe extern "C" fn js_cmodule(
     }
 
     let code_size = size as usize;
-    let code = libc::mmap(
-        ptr::null_mut(),
-        code_size,
-        libc::PROT_READ | libc::PROT_WRITE,
+    let Some(map_size) = page_align_len(code_size) else {
+        tcc_delete(state);
+        return throw_internal_error(ctx, "CModule mmap size overflow");
+    };
+    let code = raw_mmap(
+        map_size,
+        libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
         libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-        -1,
-        0,
     );
     if code == libc::MAP_FAILED {
         tcc_delete(state);
         return throw_internal_error(ctx, "CModule mmap(RWX) failed");
     }
-    mark_cmodule_code_vma(code, code_size);
+    mark_cmodule_code_vma(code, map_size);
 
     compile_ctx.errors.clear();
     tcc_set_error_func(state, &mut compile_ctx as *mut _ as *mut c_void, Some(append_error));
@@ -519,21 +581,27 @@ unsafe extern "C" fn js_cmodule(
         } else {
             compile_ctx.errors
         };
-        libc::munmap(code, code_size);
+        let _ = raw_munmap(code, map_size);
         tcc_delete(state);
         return throw_internal_error(ctx, format!("CModule link failed: {}", err));
     }
     ffi::qjs_clear_cache(code as *mut c_void, (code as usize + code_size) as *mut c_void);
+    register_cmodule_code_range(code, map_size);
 
     let class_id = get_or_init_class_id(ctx);
     let obj = ffi::JS_NewObjectClass(ctx, class_id as i32);
     if ffi::qjs_is_exception(obj) != 0 {
-        libc::munmap(code, code_size);
+        unregister_cmodule_code_range(code, map_size);
+        let _ = raw_munmap(code, map_size);
         tcc_delete(state);
         return obj;
     }
 
-    let data = Box::into_raw(Box::new(CModuleData { state, code, code_size }));
+    let data = Box::into_raw(Box::new(CModuleData {
+        state,
+        code,
+        map_size,
+    }));
     ffi::JS_SetOpaque(obj, data as *mut c_void);
 
     let mut symbols: Vec<(String, u64)> = Vec::new();
@@ -544,7 +612,12 @@ unsafe extern "C" fn js_cmodule(
         if name.contains('\0') {
             continue;
         }
-        let ptr_val = create_native_pointer(ctx, addr);
+        let resolved_addr = CString::new(name.as_str())
+            .ok()
+            .map(|cname| tcc_get_symbol(state, cname.as_ptr()) as u64)
+            .filter(|addr| *addr != 0)
+            .unwrap_or(addr);
+        let ptr_val = create_native_pointer(ctx, resolved_addr);
         JSValue(obj).set_property(ctx, &name, ptr_val);
     }
 

@@ -15,6 +15,7 @@ use super::callback::{
     attach_on_enter_wrapper, attach_on_leave_wrapper, hook_callback_wrapper, native_attach_on_enter_wrapper,
     native_attach_on_leave_wrapper, NativeAttachCallbacks,
 };
+use super::cmodule::is_cmodule_code_address;
 use super::registry::{hook_error_message, init_registry, HookData, HookKind, StealthMode, HOOK_OK, HOOK_REGISTRY};
 use crate::jsapi::callback_util::with_registry_mut;
 
@@ -240,7 +241,7 @@ pub(crate) unsafe extern "C" fn js_call_native(
         return ffi::JS_ThrowRangeError(ctx, b"callNative() address is not mapped\0".as_ptr() as *const _);
     }
 
-    {
+    if !is_cmodule_code_address(addr) {
         let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
         if unsafe { libc::dladdr(addr as *const std::ffi::c_void, &mut info) } == 0 {
             return ffi::JS_ThrowRangeError(
@@ -691,7 +692,7 @@ pub(crate) unsafe extern "C" fn js_native_call(
     }
     // 检查页是否可执行 (PROT_EXEC): 通过 /proc/self/maps 查 prot 位。
     // 不依赖 dladdr 因为 Memory.alloc 分配的 RWX 页不在任何 loaded SO 里。
-    {
+    if !is_cmodule_code_address(addr) {
         use crate::jsapi::util::{proc_maps_entries, read_proc_self_maps};
         let maps = read_proc_self_maps();
         let mut is_exec = false;

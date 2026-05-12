@@ -320,9 +320,7 @@ pub extern "C" fn rustfrida_loadjs_current_thread(
 
 #[cfg(feature = "quickjs")]
 fn set_java_stealth_and_respond(mode: i64) {
-    match quickjs_loader::init_hook_runtime()
-        .and_then(|_| quickjs_hook::jsapi::java::set_host_stealth_mode(mode).map(|m| m.to_string()))
-    {
+    match quickjs_hook::jsapi::java::set_host_stealth_mode(mode).map(|m| m.to_string()) {
         Ok(mode) => send_eval_ok(&format!("javastealth={}", mode)),
         Err(e) => send_eval_err(&format!("javastealth failed: {}", e)),
     }
